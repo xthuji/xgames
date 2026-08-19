@@ -1,0 +1,16 @@
+{
+  "name": "xgames-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "XGames 斗地主 E2E 浏览器自动化测试",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:debug": "playwright test --debug",
+    "test:practice": "playwright test practice-game",
+    "test:sync": "playwright test state-sync"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.40.0"
+  }
+}

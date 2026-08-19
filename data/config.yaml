@@ -1,0 +1,49 @@
+# 斗地主联网对战 App 配置（v2.5）
+
+server:
+  # HTTP/WebSocket 监听地址
+  host: "0.0.0.0"
+  port: 3040
+  # 最大并发连接数（0 表示无限制）
+  max_connections: 10000
+
+sqlite:
+  # 数据库文件路径（相对程序目录，自动创建）
+  path: "data/ddz.db"
+
+game:
+  # 玩家出牌回合超时时间（秒）
+  turn_timeout: 30
+  # 叫分/加倍决策超时时间（秒）
+  bid_timeout: 15
+  # 房间等待超时时间（分钟），超时自动解散
+  room_timeout: 10
+  # 优雅关闭超时时间（分钟），等待游戏结束的最长时间
+  shutdown_timeout: 30
+  # 优雅关闭检测间隔（秒）
+  shutdown_check_interval: 15
+  # 玩家离线后座位保留时间（秒）
+  offline_wait_timeout: 30
+
+security:
+  # 允许的 Origin（WebSocket 握手时校验）
+  # 开发环境默认 ["*"] 允许所有；生产部署请限制具体域名，例如：
+  #   allowed_origins: ["https://yourdomain.com", "http://localhost:3030"]
+  # 单应用本地启动保持 ["*"] 即可（host 默认 127.0.0.1，仅本机访问）
+  allowed_origins:
+    - "*"
+  # 连接速率限制（per IP）
+  rate_limit:
+    max_per_second: 10
+    max_per_minute: 60
+    ban_duration: 60
+  # 消息速率限制（per connection）
+  message_limit:
+    max_per_second: 20
+
+bot:
+  # 是否启用机器人（冷启动填充 / 人机练习）
+  enabled: true
+  # 玩家等待多少秒后由机器人填充剩余座位
+  bot_fill_timeout: 15
+  # 决策引擎：纯代码规则启发式（无外部依赖），按对局难度分为简单/正常/专家三档策略

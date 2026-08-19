@@ -1,15 +1,51 @@
-# Binaries for programs and plugins
+# === Go ===
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-
-# Test binary, built with `go test -c`
 *.test
-
-# Output of the go coverage tool, specifically when used with LiteIDE
 *.out
 
-# Dependency directories (remove the comment below to include it)
-# vendor/
+# === Binaries ===
+/ddz
+/ddz-*
+/xgames
+/xgames-*
+
+# === Build artifacts ===
+build/
+dist/
+release/
+
+# === Frontend ===
+web/node_modules/
+web/dist/
+web/.vite/
+web/wailsjs/runtime/
+
+# === OS / Temp ===
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+e2e_*.png
+
+# === Runtime data ===
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/replays/
+
+# === IDE ===
+.idea/
+.vscode/
+
+# === Build runtime logs ===
+build/*.log
+
+# === Test artifacts & dependencies ===
+tests/e2e/node_modules/
+tests/e2e/test-results/
+tests/e2e/playwright-report/
+tests/flow/node_modules/

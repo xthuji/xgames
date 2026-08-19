@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>XGames</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #182d3b; }
+    #game { width: 100%; height: 100%; }
+    #game canvas { margin: 0 auto; }
+    #reconnect-mask {
+      display: none; position: fixed; inset: 0; z-index: 99;
+      background: rgba(0, 0, 0, 0.55); color: #ffd54f;
+      font: 24px Arial, sans-serif; align-items: center; justify-content: center;
+    }
+  </style>
+</head>
+<body>
+  <div id="game"></div>
+  <div id="reconnect-mask">网络断开，重连中…</div>
+  <script type="module" src="./src/main.ts"></script>
+</body>
+</html>

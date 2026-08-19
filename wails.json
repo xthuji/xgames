@@ -1,0 +1,56 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "XGames",
+  "outputfilename": "XGames",
+  "frontend:dir": "web",
+  "frontend:install": "npm install --no-audit --no-fund",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "assetdir": "web/dist",
+  "author": {
+    "name": "XGames",
+    "email": ""
+  },
+  "info": {
+    "productName": "XGames",
+    "companyName": "",
+    "fileDescription": "XGames - 休闲棋牌游戏平台",
+    "copyright": "",
+    "productVersion": "1.0.0"
+  },
+  "app": {
+    "width": 1400,
+    "height": 900,
+    "minWidth": 1100,
+    "minHeight": 700,
+    "resizable": true,
+    "fullscreen": false,
+    "title": "XGames - 斗地主",
+    "backgroundColour": "#1a1a2e",
+    "hideWindowOnClose": false
+  },
+  "mac": {
+    "titleBar": {
+      "titleBarStyle": "hiddenInset",
+      "hideTitle": false,
+      "hideTitleBar": false,
+      "fullSizeContent": true,
+      "useToolbar": false,
+      "toolbarStyle": "automatic",
+      "showToolbarButton": false
+    },
+    "webviewIsTransparent": false,
+    "windowIsTranslucent": false,
+    "about": {
+      "title": "XGames",
+      "copyright": "",
+      "credits": "",
+      "version": "1.0.0"
+    },
+    "entitlements": {
+      "development": {},
+      "production": {}
+    },
+    "signing": {}
+  }
+}

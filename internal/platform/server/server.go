@@ -42,6 +42,8 @@ type App struct {
 	webDir string // 前端项目根目录（dev 模式用）
 
 	replayDir string // 复盘报告根目录（默认相对路径，main 根据运行环境注入）
+
+	userSettings *config.UserSettings // 用户级运行开关（局域网对战），main 注入
 }
 
 // NewApp 装配全部组件（依赖游戏已通过 games.Register 注册）
@@ -73,6 +75,24 @@ func (a *App) WithDev(webDir string) *App {
 func (a *App) WithReplayDir(dir string) *App {
 	a.replayDir = dir
 	return a
+}
+
+// WithUserSettings 注入用户级运行开关，并透传给 Hub（供更新处理）。
+func (a *App) WithUserSettings(us *config.UserSettings) *App {
+	a.userSettings = us
+	a.hub.userSettings = us
+	return a
+}
+
+// lanPlay 依据实际监听地址判断是否为局域网模式（绑定非回环地址即视为开启）。
+// 以真实绑定地址为单一真值，而非开关本身，避免 UI 与进程实际状态漂移。
+func (a *App) lanPlay() bool {
+	addr, _ := a.listenAddr.Load().(string)
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	return host == "0.0.0.0" || host == "::"
 }
 
 // SetListenAddr 记录实际监听地址（端口被占用时会自动上移，前端不能写死）
@@ -117,7 +137,7 @@ func (a *App) Handler() http.Handler {
 	// 前端不能写死 localhost:3030；Wails 内该请求同样经 AssetServer.Handler 路由到这里。
 	mux.HandleFunc("/app-config.json", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"ws_url":%q}`, a.clientWSURL())
+		fmt.Fprintf(w, `{"ws_url":%q,"lan_play":%t}`, a.clientWSURL(), a.lanPlay())
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

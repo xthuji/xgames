@@ -366,17 +366,14 @@ sync_app_icon() {
 }
 
 # 将构建产物复制到 release 目录
+# macOS 例外：release 只保留成品 DMG（build_dmg 直接从 build/bin 取 .app），
+# 不再同步 .app，并清理历史残留
 sync_release() {
   local release_dir="$PROJECT_DIR/release"
   mkdir -p "$release_dir"
 
   if [ "$HOST_OS" = "darwin" ]; then
-    local app_path="$BUILD_DIR/bin/${APP_NAME}.app"
-    local release_app="${release_dir}/${APP_NAME}.app"
-    [ -d "$app_path" ] || return 0
-    rm -rf "$release_app"
-    cp -R "$app_path" "$release_app"
-    log_success "Release App  → $release_app"
+    rm -rf "${release_dir}/${APP_NAME}.app"
   else
     local bin_path
     bin_path=$(get_build_binary)
@@ -389,30 +386,43 @@ sync_release() {
 }
 
 # macOS only: 用 hdiutil 生成 DMG（文件名带版本号）
+# 卷内包含 App + Applications 快捷方式，支持拖拽安装；不碰 Finder 定制，打包全程无窗口弹出
 build_dmg() {
   [ "$HOST_OS" = "darwin" ] || return 0
   local version
   version=$(get_version)
   local app_path="$BUILD_DIR/bin/${APP_NAME}.app"
   local release_dir="$PROJECT_DIR/release"
-  local release_app="${release_dir}/${APP_NAME}.app"
   local release_dmg="${release_dir}/${APP_NAME}_v${version}.dmg"
 
-  # 优先使用 release 目录下已同步的 app，否则使用构建目录的
-  local source_app="$release_app"
-  [ -d "$source_app" ] || source_app="$app_path"
+  # 直接取构建目录的 app，release 目录只落 DMG
+  local source_app="$app_path"
   [ -d "$source_app" ] || return 0
 
   mkdir -p "$release_dir"
   rm -f "$release_dmg"
 
+  # staging 目录：App + Applications 符号链接（hdiutil 会将其写入为
+  # Finder 别名，用户拖到此处即完成安装）
+  local staging
+  staging="$(mktemp -d "${TMPDIR:-/tmp}/${APP_NAME}_dmg.XXXXXX")"
+  trap "rm -rf '$staging'" EXIT
+  cp -R "$source_app" "$staging/${APP_NAME}.app"
+  ln -s /Applications "$staging/Applications"
+
   log_info "生成 DMG: ${APP_NAME}_v${version}.dmg ..."
   hdiutil create \
     -volname "$APP_NAME" \
-    -srcfolder "$source_app" \
+    -srcfolder "$staging" \
     -ov \
     -format UDZO \
     "$release_dmg" > /dev/null
+
+  rm -rf "$staging"
+  trap - EXIT
+
+  # 清理 release 中历史同步残留的 .app，只保留 DMG 成品
+  rm -rf "${release_dir}/${APP_NAME}.app"
 
   log_success "Release DMG  → $release_dmg"
 }
@@ -736,7 +746,7 @@ XGames 构建工具
   0|exit      退出
 
 平台说明:
-  macOS:   构建 .app + .dmg (darwin/universal)
+  macOS:   构建 .app + .dmg (darwin/universal)，release/ 只保留 .dmg
   Linux:   构建 ELF 二进制 + .zip (linux/$HOST_ARCH)
   Windows: 构建 .exe + .zip (windows/$HOST_ARCH)
 

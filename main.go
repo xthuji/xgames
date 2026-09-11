@@ -85,6 +85,14 @@ func main() {
 		dbPath = filepath.Join(dataDir, dbPath)
 	}
 
+	// 用户级运行设置（局域网对战开关）持久化到用户数据目录 settings.json，
+	// 开发态回落到项目根（appDir），不写入 .app 包内（升级会被覆盖）。
+	settingsDir := dataDir
+	if settingsDir == "" {
+		settingsDir = appDir
+	}
+	userSettings := config.NewUserSettings(filepath.Join(settingsDir, "settings.json"), logger)
+
 	// 复盘报告目录：与数据库同源，打包运行放用户持久化目录，开发模式放项目 data/ 下；
 	// 写入（SaveUserReport）与读取（/api/replays）共用同一目录
 	replayDir := replayDirFor(appDir, dataDir)
@@ -110,7 +118,7 @@ func main() {
 	chess.Register(logger, cfg.Bot.Enabled)
 	mahjong.Register(logger, cfg.Bot.Enabled)
 
-	app := server.NewApp(cfg, st, logger).WithReplayDir(replayDir)
+	app := server.NewApp(cfg, st, logger).WithReplayDir(replayDir).WithUserSettings(userSettings)
 
 	var devWatcher *server.DevWatcher
 	if *dev {
@@ -135,7 +143,7 @@ func main() {
 	app.Restore(restoreCtx)
 	cancelRestore()
 
-	ln, err := findListener(cfg.Server.Host, cfg.Server.Port)
+	ln, err := findListener(userSettings.BindHost(cfg.Server.Host), cfg.Server.Port)
 	if err != nil {
 		logger.Error("无法分配监听端口", "err", err)
 		os.Exit(1)

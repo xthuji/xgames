@@ -61,6 +61,7 @@ const (
 	MsgGetMaintenanceStatus MessageType = "get_maintenance_status" // 获取维护状态
 	MsgUpdateProfile        MessageType = "update_profile"         // 更新玩家资料
 	MsgUpdateReplaySetting  MessageType = "update_replay_setting"  // 更新复盘功能设置
+	MsgUpdateLanPlay        MessageType = "update_lan_play"         // 更新局域网对战开关（重启生效）
 	MsgGameSync             MessageType = "game_sync"              // 对局同步检测（客户端主动查询）
 	MsgRequestGameState     MessageType = "request_game_state"     // 请求对局状态（场景恢复用）
 	MsgClearUserData        MessageType = "clear_user_data"        // 清理用户数据（房间+对战）
@@ -101,6 +102,7 @@ const (
 	MsgError                 MessageType = "error"                    // 错误消息
 	MsgProfileUpdated        MessageType = "profile_updated"          // 资料更新通知
 	MsgReplaySettingUpdated  MessageType = "replay_setting_updated"   // 复盘功能设置更新通知
+	MsgLanPlayUpdated        MessageType = "lan_play_updated"         // 局域网对战开关更新通知
 
 	// 同步
 	MsgGameSyncResult  MessageType = "game_sync_result"  // 对局同步检测结果

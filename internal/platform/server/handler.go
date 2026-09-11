@@ -64,6 +64,8 @@ func (h *Hub) dispatch(c *ws.Conn, msg protocol.Message) {
 		h.handleUpdateProfile(c, msg)
 	case protocol.MsgUpdateReplaySetting:
 		h.handleUpdateReplaySetting(c, msg)
+	case protocol.MsgUpdateLanPlay:
+		h.handleUpdateLanPlay(c, msg)
 	case protocol.MsgGameSync:
 		h.handleGameSync(c)
 	case protocol.MsgRequestGameState:
@@ -612,6 +614,30 @@ func (h *Hub) handleUpdateReplaySetting(c *ws.Conn, msg protocol.Message) {
 	}))
 	
 	h.logger.Info("玩家更新复盘功能设置", "player", c.PlayerID(), "replay_enabled", payload.ReplayEnabled)
+}
+
+// handleUpdateLanPlay 保存局域网对战开关到用户设置文件（settings.json）。
+// 监听地址在进程启动时一次性绑定，此处不重绑 listener；需重启后生效。
+func (h *Hub) handleUpdateLanPlay(c *ws.Conn, msg protocol.Message) {
+	payload, err := protocol.ParsePayload[protocol.UpdateLanPlayPayload](msg)
+	if err != nil {
+		c.SendError(protocol.ErrCodeInvalidMsg, "")
+		return
+	}
+	if h.userSettings == nil {
+		c.SendError(protocol.ErrCodeInvalidMsg, "settings unavailable")
+		return
+	}
+	if err := h.userSettings.SetLanPlay(payload.LanPlay); err != nil {
+		h.logger.Error("保存局域网对战设置失败", "player", c.PlayerID(), "err", err)
+		c.SendError(protocol.ErrCodeInvalidMsg, "save failed")
+		return
+	}
+	c.Send(protocol.NewMessage(protocol.MsgLanPlayUpdated, protocol.LanPlayUpdatedPayload{
+		LanPlay:         payload.LanPlay,
+		RestartRequired: true,
+	}))
+	h.logger.Info("玩家更新局域网对战设置", "player", c.PlayerID(), "lan_play", payload.LanPlay)
 }
 
 // --- 错误映射 ---

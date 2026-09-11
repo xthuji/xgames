@@ -2,23 +2,31 @@ import Phaser from 'phaser';
 import { store } from '../state/store';
 import { getOrCreateMachineID } from '../utils/machine';
 import { net } from '../net/ws';
-import { MsgTypes, ProfileUpdatedPayload, UpdateReplaySettingPayload } from '../protocol';
+import {
+  MsgTypes,
+  ProfileUpdatedPayload,
+  UpdateReplaySettingPayload,
+  UpdateLanPlayPayload,
+} from '../protocol';
 
 const FONT = { fontFamily: 'Arial', fontSize: '18px', color: '#ffffff' } as Phaser.Types.GameObjects.Text.TextStyle;
 
 /**
  * SettingsScene 用户设置页面
  * - 修改昵称（使用 DOM 输入框）
- * - 显示设备标识
- * - 清理本地缓存
+ * - 复盘功能开关
+ * - 局域网对战开关（重启生效）
+ * - 显示设备标识 / 清理本地缓存
+ *
+ * 布局以屏幕中心为基准用「垂直游标」自上而下排布，避免固定坐标在窗口
+ * 最小高度（700）下与底部按钮区重叠。
  */
 export class SettingsScene extends Phaser.Scene {
   private unsubscribers: Array<() => void> = [];
   private nameInput!: HTMLInputElement;
   private statusText!: Phaser.GameObjects.Text;
-  private replayToggle!: Phaser.GameObjects.Rectangle;
-  private replayToggleLabel!: Phaser.GameObjects.Text;
   private replayEnabled = true; // 默认启用复盘功能
+  private lanEnabled = false; // 默认关闭局域网对战（仅本机监听）
 
   constructor() {
     super({ key: 'Settings' });
@@ -28,11 +36,16 @@ export class SettingsScene extends Phaser.Scene {
     const width = this.scale.width;
     const height = this.scale.height;
 
-    // 从 localStorage 读取复盘功能设置
-    const savedReplaySetting = localStorage.getItem('replay_enabled');
-    if (savedReplaySetting !== null) {
-      this.replayEnabled = savedReplaySetting === 'true';
+    // 复盘开关初值（localStorage 持久）
+    const savedReplay = localStorage.getItem('replay_enabled');
+    if (savedReplay !== null) {
+      this.replayEnabled = savedReplay === 'true';
     }
+
+    // 局域网对战初值：以服务端回显的真实绑定状态（store.lanPlay）为准，
+    // localStorage 仅作 WS/探测未就绪前的即时反射兜底。
+    const savedLan = localStorage.getItem('lan_play');
+    this.lanEnabled = store.lanPlay || savedLan === 'true';
 
     // 背景
     this.add.rectangle(0, 0, width, height, 0x1a1a2e).setOrigin(0);
@@ -46,14 +59,45 @@ export class SettingsScene extends Phaser.Scene {
       strokeThickness: 3,
     }).setOrigin(0.5);
 
+    // 垂直游标：各区块依次向下排布
+    let y = height / 2 - 160;
+
     // 昵称输入区域
-    this.createNameInputSection(width, height);
+    y = this.createNameInputSection(width, y);
 
     // 复盘功能开关
-    this.createReplayToggleSection(width, height);
+    this.createToggle(width, y, {
+      title: '对战游戏复盘功能',
+      desc: '启用后，对局结束时可查看详细的决策分析和改进建议',
+      enabled: this.replayEnabled,
+      onChange: (v: boolean) => {
+        this.replayEnabled = v;
+        localStorage.setItem('replay_enabled', String(v));
+        net.send(MsgTypes.MsgUpdateReplaySetting, { replay_enabled: v } satisfies UpdateReplaySettingPayload);
+        this.statusText.setText(v ? '复盘功能已启用' : '复盘功能已禁用').setColor('#4caf50');
+      },
+    });
+    y += 88;
+
+    // 局域网对战开关
+    this.createToggle(width, y, {
+      title: '局域网对战',
+      desc: '开启后同一局域网内设备可联机对战（重启生效，可能弹防火墙授权）',
+      enabled: this.lanEnabled,
+      onChange: (v: boolean) => {
+        this.lanEnabled = v;
+        store.lanPlay = v;
+        localStorage.setItem('lan_play', String(v));
+        net.send(MsgTypes.MsgUpdateLanPlay, { lan_play: v } satisfies UpdateLanPlayPayload);
+        this.statusText
+          .setText(v ? '已开启局域网对战，重启后生效' : '已关闭局域网对战，重启后生效')
+          .setColor('#ffb74d');
+      },
+    });
+    y += 76;
 
     // 状态提示文本
-    this.statusText = this.add.text(width / 2, height / 2 + 140, '', {
+    this.statusText = this.add.text(width / 2, y, '', {
       ...FONT,
       fontSize: '16px',
       color: '#81d4fa',
@@ -116,11 +160,9 @@ export class SettingsScene extends Phaser.Scene {
     }
   }
 
-  private createNameInputSection(width: number, height: number) {
-    const centerY = height / 2 - 60;
-
-    // 标签
-    this.add.text(width / 2, centerY - 80, '昵称（1-20 字符）', {
+  /** 绘制昵称输入区，返回游标向下推进后的新 y 值 */
+  private createNameInputSection(width: number, y: number): number {
+    this.add.text(width / 2, y, '昵称（1-20 字符）', {
       ...FONT,
       color: '#cccccc',
     }).setOrigin(0.5);
@@ -145,11 +187,11 @@ export class SettingsScene extends Phaser.Scene {
       </div>
     `;
 
-    const domElement = this.add.dom(width / 2, centerY - 30).createFromHTML(html);
+    const domElement = this.add.dom(width / 2, y + 42).createFromHTML(html);
     this.nameInput = domElement.node.querySelector('input')!;
 
     // 保存按钮
-    this.add.text(width / 2, centerY + 40, '保存昵称', {
+    this.add.text(width / 2, y + 92, '保存昵称', {
       ...FONT,
       fontSize: '20px',
       color: '#4caf50',
@@ -159,76 +201,63 @@ export class SettingsScene extends Phaser.Scene {
       .setOrigin(0.5)
       .setInteractive({ useHandCursor: true })
       .on('pointerdown', () => this.handleSaveName());
+
+    return y + 128;
   }
 
-  /** 创建复盘功能开关 */
-  private createReplayToggleSection(width: number, height: number) {
-    const centerY = height / 2 + 20;
-    
-    // 标题
-    this.add.text(width / 2, centerY - 40, '对战游戏复盘功能', {
+  /** 通用开关行：标题 + 说明 + 可点击滑块，点击时回调 onChange(新值) */
+  private createToggle(
+    width: number,
+    y: number,
+    opts: { title: string; desc: string; enabled: boolean; onChange: (v: boolean) => void },
+  ): void {
+    this.add.text(width / 2, y, opts.title, {
       ...FONT,
       fontSize: '20px',
       color: '#ffd54f',
     }).setOrigin(0.5);
 
-    // 说明文字
-    this.add.text(width / 2, centerY - 15, '启用后，对局结束时可查看详细的决策分析和改进建议', {
+    this.add.text(width / 2, y + 24, opts.desc, {
       ...FONT,
-      fontSize: '14px',
+      fontSize: '13px',
       color: '#aaaaaa',
     }).setOrigin(0.5);
 
-    // 开关背景
+    let cur = opts.enabled;
     const toggleX = width / 2 - 80;
-    const toggleY = centerY + 20;
-    
-    this.replayToggle = this.add.rectangle(toggleX, toggleY, 80, 40, this.replayEnabled ? 0x4caf50 : 0x757575, 0.8)
+    const toggleY = y + 56;
+
+    const bg = this.add.rectangle(toggleX, toggleY, 80, 40, cur ? 0x4caf50 : 0x757575, 0.8)
       .setStrokeStyle(2, 0xffffff, 0.6)
       .setInteractive({ useHandCursor: true });
-    
-    // 开关滑块
-    const sliderX = this.replayEnabled ? toggleX + 20 : toggleX - 20;
-    const slider = this.add.circle(sliderX, toggleY, 16, 0xffffff);
-    
-    // 状态标签
-    this.replayToggleLabel = this.add.text(toggleX + 60, toggleY, 
-      this.replayEnabled ? '已启用' : '已禁用', 
-      { ...FONT, fontSize: '16px', color: this.replayEnabled ? '#4caf50' : '#999999' }
-    ).setOrigin(0, 0.5);
-    
-    // 点击切换
-    this.replayToggle.on('pointerdown', () => {
-      this.replayEnabled = !this.replayEnabled;
-      
-      // 更新开关外观
-      this.replayToggle.setFillStyle(this.replayEnabled ? 0x4caf50 : 0x757575, 0.8);
-      slider.x = this.replayEnabled ? toggleX + 20 : toggleX - 20;
-      this.replayToggleLabel.setText(this.replayEnabled ? '已启用' : '已禁用');
-      this.replayToggleLabel.setColor(this.replayEnabled ? '#4caf50' : '#999999');
-      
-      // 保存到 localStorage
-      localStorage.setItem('replay_enabled', String(this.replayEnabled));
-      
-      // 发送消息到后端
-      net.send(MsgTypes.MsgUpdateReplaySetting, { replay_enabled: this.replayEnabled } satisfies UpdateReplaySettingPayload);
-      
-      // 显示提示
-      this.statusText.setText(this.replayEnabled ? '复盘功能已启用' : '复盘功能已禁用').setColor('#4caf50');
+
+    const slider = this.add.circle(cur ? toggleX + 20 : toggleX - 20, toggleY, 16, 0xffffff);
+
+    const label = this.add.text(toggleX + 60, toggleY, cur ? '已启用' : '已禁用', {
+      ...FONT,
+      fontSize: '16px',
+      color: cur ? '#4caf50' : '#999999',
+    }).setOrigin(0, 0.5);
+
+    const redraw = () => {
+      bg.setFillStyle(cur ? 0x4caf50 : 0x757575, 0.8);
+      slider.x = cur ? toggleX + 20 : toggleX - 20;
+      label.setText(cur ? '已启用' : '已禁用');
+      label.setColor(cur ? '#4caf50' : '#999999');
+    };
+
+    bg.on('pointerdown', () => {
+      cur = !cur;
+      redraw();
+      opts.onChange(cur);
     });
-    
-    // 鼠标悬停效果
-    this.replayToggle.on('pointerover', () => {
-      this.replayToggle.setStrokeStyle(2, 0xffd54f, 0.8);
-    });
-    this.replayToggle.on('pointerout', () => {
-      this.replayToggle.setStrokeStyle(2, 0xffffff, 0.6);
-    });
+    bg.on('pointerover', () => bg.setStrokeStyle(2, 0xffd54f, 0.8));
+    bg.on('pointerout', () => bg.setStrokeStyle(2, 0xffffff, 0.6));
   }
 
   private handleSaveName() {
     const newName = this.nameInput.value.trim();
-    
+
     if (!newName) {
       this.statusText.setText('昵称不能为空').setColor('#ff6b6b');
       return;

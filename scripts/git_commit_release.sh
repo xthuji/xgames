@@ -48,7 +48,7 @@ ${BOLD}选项:${NC}
 
 ${BOLD}示例:${NC}
   $0                                    # 全流程交互式
-  $0 -m "feat: 支持天气多源切换"         # 指定 message
+  $0 -m "feat: 支持多源切换"         # 指定 message
   $0 -m "docs: 更新架构文档" --no-release # 不触发发布
   $0 --dry-run                          # 预览
 EOF
@@ -70,7 +70,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# 打印并执行命令；dry-run 时只打印
+# 打印并执行命令；dry-run 时只打印。直接传参数数组，绝不 eval，避免 message 内容被 shell 二次解析。
 run() {
     if $DRY_RUN; then
         echo -e "  ${YELLOW}[dry-run]${NC} $*"
@@ -170,7 +170,7 @@ fi
 DRY_ARG=""
 $DRY_RUN && DRY_ARG="--dry-run"
 
-run ./scripts/release.sh $DRY_ARG
+run "${SCRIPT_DIR}/release.sh" $DRY_ARG
 
 echo ""
 if $DRY_RUN; then

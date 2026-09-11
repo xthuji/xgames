@@ -49,6 +49,8 @@ export const MsgTypes = {
   MsgUpdateProfile: 'update_profile',
   /** 更新复盘功能设置 */
   MsgUpdateReplaySetting: 'update_replay_setting',
+  /** 更新局域网对战开关（重启生效） */
+  MsgUpdateLanPlay: 'update_lan_play',
   /** 对局同步检测（客户端主动查询） */
   MsgGameSync: 'game_sync',
   /** 请求对局状态（场景恢复用） */
@@ -99,6 +101,8 @@ export const MsgTypes = {
   MsgProfileUpdated: 'profile_updated',
   /** 复盘功能设置更新通知 */
   MsgReplaySettingUpdated: 'replay_setting_updated',
+  /** 局域网对战开关更新通知 */
+  MsgLanPlayUpdated: 'lan_play_updated',
   /** 对局同步检测结果 */
   MsgGameSyncResult: 'game_sync_result',
   /** 对局状态响应（请求状态恢复） */
@@ -598,6 +602,14 @@ export interface JoinRoomPayload {
   room_code: string;
 }
 
+/** LanPlayUpdatedPayload 局域网对战开关更新通知 */
+export interface LanPlayUpdatedPayload {
+  /** 最新开关状态 */
+  lan_play: boolean;
+  /** 是否需要重启生效 */
+  restart_required: boolean;
+}
+
 /** LandlordPayload 地主确定通知 */
 export interface LandlordPayload {
   player_id: string;
@@ -1016,6 +1028,12 @@ export interface StatsResultPayload {
   rank: number;
   current_streak: number;
   max_win_streak: number;
+}
+
+/** UpdateLanPlayPayload 更新局域网对战开关请求（重启后生效） */
+export interface UpdateLanPlayPayload {
+  /** 是否开启局域网对战（监听 0.0.0.0） */
+  lan_play: boolean;
 }
 
 /** UpdateProfilePayload 更新玩家资料请求 */

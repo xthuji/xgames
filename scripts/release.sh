@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# XGames - 发布工具
+# Project Repository - 发布工具
 # =============================================================================
 # 读取根目录 VERSION 创建 git tag v{version}，推送到 GitHub 远程，
 # 触发 .github/workflows/release.yml 在 macOS / Linux / Windows 三平台
@@ -64,6 +64,8 @@ done
 
 cd "$ROOT_DIR"
 
+git rev-parse --is-inside-work-tree &>/dev/null || die "当前目录不是 Git 仓库: $ROOT_DIR"
+
 if [[ -n "$CUSTOM_VERSION" ]]; then
     APP_VERSION="$CUSTOM_VERSION"
 else
@@ -78,21 +80,36 @@ fi
 TAG_NAME="v${APP_VERSION}"
 
 echo ""
-echo -e "${CYAN}${BOLD}═══ XGames Release ═══${NC}"
+echo -e "${CYAN}${BOLD}═══ Project Release ═══${NC}"
 echo -e "  版本: ${BOLD}${APP_VERSION}${NC}"
 echo -e "  Tag:  ${BOLD}${TAG_NAME}${NC}"
 echo -e "  远程: ${BOLD}${REMOTE_NAME}${NC}"
 echo -e "  模式: $($DRY_RUN && echo -e "${YELLOW}DRY-RUN${NC}" || echo -e "${GREEN}实际执行${NC}")"
 echo ""
 
+# 打印并执行命令；dry-run 时只打印。直接传参数数组，绝不 eval。
 run() {
+    local display="" arg
+    for arg in "$@"; do
+        if [[ "$arg" == *[[:space:]]* ]]; then
+            display+=" '${arg}'"
+        else
+            display+=" ${arg}"
+        fi
+    done
+    display="${display# }"
     if $DRY_RUN; then
-        echo -e "  ${YELLOW}[dry-run]${NC} $*"
+        echo -e "  ${YELLOW}[dry-run]${NC} ${display}"
     else
-        info "$*"
-        eval "$@"
+        info "${display}"
+        "$@"
     fi
 }
+
+# 工作区必须干净：避免发布未提交代码（源头一致性）；--dry-run 仅预览不受此限。
+if ! $DRY_RUN && ! git diff --quiet HEAD; then
+    die "存在未提交的代码变更，请先提交（或使用 scripts/git_commit_release.sh 一步完成）"
+fi
 
 # 检查远程是否存在
 if git remote get-url "$REMOTE_NAME" &>/dev/null; then
@@ -111,10 +128,10 @@ if git rev-parse "$TAG_NAME" &>/dev/null; then
 fi
 
 # 创建/更新 tag
-run "git tag -f -a '${TAG_NAME}' -m 'Release ${TAG_NAME}'"
+run git tag -f -a "${TAG_NAME}" -m "Release ${TAG_NAME}"
 
 # 推送 tag 到远程
-run "git push '${REMOTE_NAME}' 'refs/tags/${TAG_NAME}' --force"
+run git push "${REMOTE_NAME}" "refs/tags/${TAG_NAME}" --force
 
 if $DRY_RUN; then
     echo ""

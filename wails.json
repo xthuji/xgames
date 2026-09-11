@@ -16,7 +16,7 @@
     "companyName": "",
     "fileDescription": "XGames - 休闲棋牌游戏平台",
     "copyright": "",
-    "productVersion": "1.0.0"
+    "productVersion": "1.0.1"
   },
   "app": {
     "width": 1400,
@@ -45,7 +45,7 @@
       "title": "XGames",
       "copyright": "",
       "credits": "",
-      "version": "1.0.0"
+      "version": "1.0.1"
     },
     "entitlements": {
       "development": {},

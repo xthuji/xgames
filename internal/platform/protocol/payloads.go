@@ -249,6 +249,11 @@ type UpdateReplaySettingPayload struct {
 	ReplayEnabled bool `json:"replay_enabled"` // 是否启用复盘功能
 }
 
+// UpdateLanPlayPayload 更新局域网对战开关请求（重启后生效）
+type UpdateLanPlayPayload struct {
+	LanPlay bool `json:"lan_play"` // 是否开启局域网对战（监听 0.0.0.0）
+}
+
 // ProfileUpdatedPayload 资料更新通知
 type ProfileUpdatedPayload struct {
 	PlayerID   string `json:"player_id"`
@@ -259,6 +264,12 @@ type ProfileUpdatedPayload struct {
 type ReplaySettingUpdatedPayload struct {
 	PlayerID      string `json:"player_id"`
 	ReplayEnabled bool   `json:"replay_enabled"` // 复盘功能状态
+}
+
+// LanPlayUpdatedPayload 局域网对战开关更新通知
+type LanPlayUpdatedPayload struct {
+	LanPlay         bool `json:"lan_play"`          // 最新开关状态
+	RestartRequired bool `json:"restart_required"` // 是否需要重启生效
 }
 
 // UserDataClearedPayload 用户数据清理完成通知

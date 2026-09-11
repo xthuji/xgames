@@ -36,6 +36,8 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 data/replays/
+# 开发模式用户级设置（局域网对战开关），打包态写于用户数据目录不入仓
+/settings.json
 
 # === IDE ===
 .idea/

@@ -136,7 +136,8 @@ async function resolveWsUrl(): Promise<string> {
   try {
     const res = await fetch('/app-config.json');
     if (res.ok) {
-      const cfg = (await res.json()) as { ws_url?: string };
+      const cfg = (await res.json()) as { ws_url?: string; lan_play?: boolean };
+      if (typeof cfg.lan_play === 'boolean') store.lanPlay = cfg.lan_play;
       if (cfg.ws_url) return cfg.ws_url;
     }
   } catch {

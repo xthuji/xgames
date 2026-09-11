@@ -12,6 +12,9 @@ export const store = {
   onlineCount: 0,
   maintenance: false,
 
+  /** 局域网对战状态（服务端启动时依实际绑定地址回显，见 /app-config.json） */
+  lanPlay: false,
+
   /** 当前选择的游戏（外壳侧边栏驱动，与 platform/registry 共用同一 localStorage key） */
   currentGameID: localStorage.getItem('xgames_current_game') ?? 'ddz',
   setCurrentGame(id: string) {

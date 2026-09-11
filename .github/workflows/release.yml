@@ -1,4 +1,17 @@
-name: Release
+name: Release XGames
+
+# =============================================================================
+# v* tag 触发，三平台并行构建，汇总发布到 GitHub Release。
+#
+# 全部构建相关逻辑集中在 ./scripts/run_tools.sh build（自动按当前 runner 平台分派）：
+#   - 构建依赖准备：Linux apt 装 GTK3/WebKit2GTK + 生成 webkit2gtk-4.0.pc 兼容别名；
+#     Windows 探测/安装 MinGW-w64（CGO）；macOS 校验 clang；并自动安装 Wails CLI
+#   - 前端构建（Vite）+ 协议生成 + wails build + 打包：
+#     macOS universal (amd64+arm64, min 12.0) → .app → .dmg（含 ad-hoc 签名）；
+#     Linux / Windows → .zip
+# 本 workflow 只做 runner 引导（checkout、Go/Node 工具链与缓存）与产物上传，不写任何
+# 系统依赖 / CGO / wails / lipo / codesign / hdiutil / zip 细节，避免与本地行为漂移。
+# =============================================================================
 
 on:
   push:
@@ -9,87 +22,125 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            platform: darwin
-            artifact: "*.dmg"
-          - os: ubuntu-22.04
-            platform: linux
-            artifact: "*.zip"
-          - os: windows-latest
-            platform: windows
-            artifact: "*.zip"
-
-    name: Build (${{ matrix.platform }})
-    runs-on: ${{ matrix.os }}
-
+  build-macos:
+    name: macOS (universal)
+    runs-on: macos-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.26'
           cache: true
+          cache-dependency-path: go.sum
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install Linux dependencies
-        if: matrix.platform == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-3-dev \
-            libwebkit2gtk-4.0-dev \
-            build-essential \
-            pkg-config \
-            libglib2.0-dev \
-            libsoup-3.0-dev \
-            javascriptcoregtk-4.0-dev \
-            zip
-
-      - name: Verify toolchain versions
-        shell: bash
-        run: |
-          go version
-          node --version
-          npm --version
-
-      - name: Build & Package
-        shell: bash
-        # 不在此处设置 CGO_*：macOS 兼容目标 (MACOSX_DEPLOYMENT_TARGET /
-        # -mmacosx-version-min) 由 run_tools.sh 按当前平台自行导出。
-        # 若写在这里会对三平台全部生效，而 -mmacosx-version-min 是 Apple clang
-        # 专有选项，Linux 的 gcc / Windows 的 mingw 会直接编译失败。
-        run: |
-          chmod +x ./scripts/run_tools.sh
-          ./scripts/run_tools.sh build
+      # run_tools.sh 内部完成：校验 clang → 安装 Wails CLI → 生成协议 + 构建前端(Vite)
+      # → wails build darwin/universal (min 12.0) → 生成 .app → 同步 config → hdiutil 生成 DMG
+      - name: Build & package via run_tools.sh
+        run: ./scripts/run_tools.sh build
 
       - name: List artifacts
-        shell: bash
         run: ls -lh release/
 
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: release/*.dmg
+
+  build-linux:
+    name: Linux (amd64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # run_tools.sh 内部完成：apt 安装 GTK3/WebKit2GTK 并生成 webkit2gtk-4.0.pc 兼容别名
+      # → 安装 Wails CLI → 构建前端 → wails build linux/amd64 → zip 打包
+      - name: Build & package via run_tools.sh
+        run: ./scripts/run_tools.sh build
+
+      - name: List artifacts
+        run: ls -lh release/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-zip
+          path: release/*.zip
+
+  build-windows:
+    name: Windows (amd64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # run_tools.sh 内部完成：探测/安装 MinGW-w64（CGO 所需 gcc）→ 安装 Wails CLI
+      # → 构建前端 → wails build windows/amd64 → zip 打包
+      - name: Build & package via run_tools.sh
+        run: ./scripts/run_tools.sh build
+
+      - name: List artifacts
+        run: ls -lh release/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: release/*.zip
+
+  release:
+    name: Create GitHub Release
+    needs: [build-macos, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lhR release/
+
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: XGames ${{ github.ref_name }}
           body: |
             ## XGames ${{ github.ref_name }}
 
-            Auto-built desktop app for macOS (universal DMG), Windows (amd64 ZIP), and Linux (amd64 ZIP).
+            跨平台桌面游戏合集，基于 Go + Wails。
+            构建逻辑由 `./scripts/run_tools.sh build` 统一实现。
 
-            - **macOS 12+**: Double-click `.dmg` to install (兼容 macOS 12 Monterey 及以上)
-            - **Windows 10+**: Extract `.zip` and run `XGames.exe`
-            - **Linux (glibc 3.2+)**: Extract `.zip` and run `./XGames`
-          files: release/${{ matrix.artifact }}
+            **下载说明:**
+            - macOS: `XGames_v*.dmg` — universal (amd64 + arm64)，兼容 macOS 12 Monterey 及以上。未做 Apple 公证，首次打开如被 Gatekeeper 拦截，请右键应用选“打开”确认一次即可。
+            - Linux: `XGames_v*_linux_amd64.zip` — 解压后运行 `./XGames`（需系统预装 `libwebkit2gtk-4.0`（或 4.1）与 `libgtk-3-0`；Ubuntu 22.04+/Debian 12+ 官方源均已提供）
+            - Windows: `XGames_v*_windows_amd64.zip` — 解压后运行 `XGames.exe`（需系统预装 WebView2 Runtime，Win 10 1803+ 默认自带）
+          files: |
+            release/*.dmg
+            release/*.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

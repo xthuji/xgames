@@ -58,6 +58,8 @@ type Hub struct {
 	conns   map[string]*ws.Conn     // playerID → 活跃连接
 	players map[string]*PlayerState // playerID → 身份（含掉线玩家）
 
+	userSettings *config.UserSettings // 局域网对战等用户级开关（App.WithUserSettings 注入，可为 nil）
+
 	maintenance atomic.Bool
 }
 

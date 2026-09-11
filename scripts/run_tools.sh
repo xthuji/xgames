@@ -96,6 +96,129 @@ check_wails() {
 }
 
 # ============================================================
+# 构建依赖准备 (跨平台，全部在脚本内完成，CI workflow 不再写系统依赖)
+#   Linux:   apt 安装 GTK3 / WebKit2GTK(+pkg-config/gcc/zip)，并为
+#            Ubuntu 24.04+ 生成 webkit2gtk-4.0.pc 兼容别名 (Wails 硬编码 4.0)
+#   Windows: 探测/安装 MinGW-w64 (CGO 所需 gcc)
+#   macOS:   校验 clang (Xcode Command Line Tools)
+# ============================================================
+# 非 root 且有 sudo 时才用 sudo（CI runner 上是免密 sudo）
+SUDO=""
+if [ "$(id -u 2>/dev/null || echo 0)" != "0" ] && command -v sudo &>/dev/null; then
+  SUDO="sudo"
+fi
+
+APT_INDEX_REFRESHED=0
+apt_refresh_once() {
+  [ "${APT_INDEX_REFRESHED:-0}" = "1" ] && return 0
+  if ! command -v apt-get &>/dev/null; then
+    log_warn "当前系统未检测到 apt-get，跳过自动依赖安装。请确保已手动安装: pkg-config libgtk-3-dev libwebkit2gtk-4.0-dev"
+    return 1
+  fi
+  APT_INDEX_REFRESHED=1
+  log_info "刷新 apt 索引 ..."
+  $SUDO apt-get update -qq || log_warn "apt-get update 未完全成功，继续尝试安装"
+  return 0
+}
+
+apt_has() {
+  apt_refresh_once || return 1
+  apt-cache show "$1" >/dev/null 2>&1
+}
+
+apt_install() {
+  apt_refresh_once || return 1
+  log_info "安装构建依赖: $*"
+  # shellcheck disable=SC2086
+  $SUDO apt-get install -y --no-install-recommends "$@" || log_error "apt-get install 失败: $*"
+}
+
+ensure_linux_deps() {
+  local need=() webkit_alias=0
+
+  command -v pkg-config &>/dev/null        || need+=("pkg-config")
+  command -v gcc &>/dev/null               || need+=("build-essential")
+  command -v zip &>/dev/null               || need+=("zip")
+  pkg-config --exists gtk+-3.0 2>/dev/null || need+=("libgtk-3-dev")
+
+  # Wails 在 Linux 依赖 webkit2gtk-4.0；Ubuntu 24.04+ 仅提供 4.1，需要生成 .pc 兼容别名
+  if pkg-config --exists webkit2gtk-4.0 2>/dev/null; then
+    : # 已可用
+  elif pkg-config --exists webkit2gtk-4.1 2>/dev/null; then
+    webkit_alias=1
+  elif apt_has libwebkit2gtk-4.0-dev; then
+    need+=("libwebkit2gtk-4.0-dev")
+  elif apt_has libwebkit2gtk-4.1-dev; then
+    need+=("libwebkit2gtk-4.1-dev"); webkit_alias=1
+  else
+    log_warn "未能自动匹配到 libwebkit2gtk 包，请确认开发环境依赖"
+  fi
+
+  [ ${#need[@]} -eq 0 ] || apt_install "${need[@]}"
+
+  if [ "$webkit_alias" = "1" ]; then
+    local pc_dir
+    pc_dir="$(pkg-config --variable=pcfiledir webkit2gtk-4.1 2>/dev/null || true)"
+    if [ -n "$pc_dir" ] && [ -f "$pc_dir/webkit2gtk-4.1.pc" ]; then
+      if [ ! -f "$pc_dir/webkit2gtk-4.0.pc" ]; then
+        log_info "生成 webkit2gtk-4.0.pc 兼容别名 → $pc_dir"
+        $SUDO cp "$pc_dir/webkit2gtk-4.1.pc" "$pc_dir/webkit2gtk-4.0.pc" \
+          || log_warn "无法写入 .pc 别名，Wails 构建可能因缺失 pkg-config 配置而失败"
+      fi
+    else
+      log_warn "未定位到 webkit2gtk-4.1.pc（pcfiledir=$pc_dir）"
+    fi
+  fi
+
+  if ! pkg-config --cflags --libs gtk+-3.0 webkit2gtk-4.0 >/dev/null 2>&1; then
+    log_error "pkg-config 无法解析 gtk+-3.0/webkit2gtk-4.0：$(pkg-config --errors --exists gtk+-3.0 webkit2gtk-4.0 2>&1 | head -3)"
+  fi
+  log_success "Linux 构建依赖就绪 (webkit2gtk-4.0 → $(pkg-config --modversion webkit2gtk-4.0))"
+}
+
+MINGW_DIRS=(
+  /c/msys64/ucrt64/bin
+  /c/msys64/mingw64/bin
+  /c/tools/mingw64/bin
+  /c/mingw64/bin
+  /c/TDM-GCC-64/bin
+)
+
+locate_mingw() {
+  if command -v gcc &>/dev/null; then
+    log_info "gcc 已就绪: $(command -v gcc)"
+    return 0
+  fi
+  local d
+  for d in "${MINGW_DIRS[@]}"; do
+    if [ -x "$d/gcc.exe" ] || [ -x "$d/gcc" ]; then
+      export PATH="$d:$PATH"
+      gcc --version >/dev/null 2>&1 || { PATH="${PATH#$d:}"; return 1; }
+      log_info "将 MinGW-w64 加入 PATH: $d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_windows_deps() {
+  locate_mingw && return 0
+  command -v choco &>/dev/null || log_error "Wails(Windows) 需要 gcc（CGO 必需）。请安装 MinGW-w64 并保证其在 PATH 中"
+  log_info "通过 chocolatey 安装 MinGW-w64 ..."
+  choco install mingw -y --no-progress || log_error "choco install mingw 失败"
+  locate_mingw || log_error "MinGW-w64 安装后仍找不到 gcc"
+  log_success "Windows 构建依赖就绪"
+}
+
+ensure_build_deps() {
+  case "$HOST_OS" in
+    linux)   ensure_linux_deps ;;
+    windows) ensure_windows_deps ;;
+    darwin)  command -v clang &>/dev/null || log_error "缺少 clang，请安装 Xcode Command Line Tools: xcode-select --install" ;;
+  esac
+}
+
+# ============================================================
 # 版本管理
 # ============================================================
 get_version() {
@@ -424,7 +547,7 @@ kill_existing() {
 }
 
 cmd_build() {
-  check_go; check_wails; check_npm
+  check_go; check_npm; ensure_build_deps; check_wails
   local version
   version=$(get_version)
   sync_wails_version

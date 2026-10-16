@@ -1,7 +1,11 @@
 package bot
 
 import (
+	"sync"
+	"sync/atomic"
+
 	"xgames/internal/games/ddz/card"
+	"xgames/internal/games/ddz/rule"
 )
 
 // 计数数组关键下标
@@ -46,14 +50,33 @@ func minHandCountWithCache(gctx *GameContext, counts [rankCount]int) int {
 	return MinHandCount(counts)
 }
 
+// minHandMemo 跨调用共享的手数记忆表：MinHandCount 是计数数组的纯函数，
+// 结果可安全并发共享（rollout 多 goroutine 高频重复子问题）。上限防长局内存膨胀。
+var (
+	minHandMemo     sync.Map
+	minHandMemoSize atomic.Int64
+)
+
+// maxMinHandMemo 共享手数记忆表上限（条目数）
+const maxMinHandMemo = 500000
+
 // MinHandCount 手牌最少出牌次数（手数）。
 // DFS + 记忆化：每步锚定剩余最小点数，枚举包含它的合法组合
-// （单/对/三/三带/炸弹/四带/顺子/连对/飞机/火箭）。
+// （单/对/三/三带/炸弹/四带/顺子/连对/飞机/火箭，见 enumerateMoves）。
 // 用于专家难度的动态手数优化与正常难度的拆牌收益评估。
 func MinHandCount(c [rankCount]int) int {
+	if v, ok := minHandMemo.Load(c); ok {
+		return v.(int)
+	}
 	nodes := 0
 	memo := make(map[[rankCount]int]int, 128)
-	return minHandCountDFS(c, memo, &nodes)
+	result := minHandCountDFS(c, memo, &nodes)
+	if minHandMemoSize.Load() < maxMinHandMemo {
+		if _, loaded := minHandMemo.LoadOrStore(c, result); !loaded {
+			minHandMemoSize.Add(1)
+		}
+	}
+	return result
 }
 
 func minHandCountDFS(c [rankCount]int, memo map[[rankCount]int]int, nodes *int) int {
@@ -69,48 +92,74 @@ func minHandCountDFS(c [rankCount]int, memo map[[rankCount]int]int, nodes *int) 
 		return total // 超限兜底：全单张上界（过滤条件退化为保守，不影响合法性）
 	}
 
+	best := total // 上界：全部单张
+	for _, m := range enumerateMoves(c) {
+		if n := 1 + minHandCountDFS(m.rest, memo, nodes); n < best {
+			best = n
+		}
+	}
+
+	memo[c] = best
+	return best
+}
+
+// decomMove 一步拆分动作：打出该组后的剩余计数与这手牌的形态。
+// 形态语义与 rule.ParseHand 一致：序列牌型 KeyRank=窗口终点，Length 对顺子为张数、
+// 对连对/飞机为节数。
+type decomMove struct {
+	rest [rankCount]int
+	ph   rule.ParsedHand
+}
+
+// enumerateMoves 枚举包含最小点数的所有合法拆分组（锚定式完全枚举）：
+// 单/对/三/三带一/三带二/炸弹/四带二/四带两对/锚点作带牌/顺子/连对/飞机族/火箭。
+// 手牌任意完整划分中恰有一组包含最小点数，锚定枚举不遗漏任何划分。
+// MinHandCount（手数最优）与整手拆牌计划器（控场最优）共用本枚举，
+// 保证两者搜索空间一致（见 handplan.go）。
+func enumerateMoves(c [rankCount]int) []decomMove {
+	total := countsTotal(c)
+	if total == 0 {
+		return nil
+	}
 	// 锚定最小点数
 	i := 0
 	for i < rankCount && c[i] == 0 {
 		i++
 	}
-
-	best := total // 上界：全部单张
-	try := func(next [rankCount]int) {
-		if n := 1 + minHandCountDFS(next, memo, nodes); n < best {
-			best = n
-		}
+	moves := make([]decomMove, 0, 24)
+	add := func(rest [rankCount]int, ph rule.ParsedHand) {
+		moves = append(moves, decomMove{rest: rest, ph: ph})
 	}
 
 	// 单张
 	n1 := c
 	n1[i]--
-	try(n1)
+	add(n1, rule.ParsedHand{Type: rule.Single, KeyRank: idxRank(i), Length: 1})
 
 	// 对子
 	if c[i] >= 2 {
 		n2 := c
 		n2[i] -= 2
-		try(n2)
+		add(n2, rule.ParsedHand{Type: rule.Pair, KeyRank: idxRank(i), Length: 1})
 	}
 
-	// 三张 / 三带一 / 三带二
+	// 三张 / 三带一 / 三带二（带牌逐点数枚举：不同带牌选择改变剩余结构，须分别评估）
 	if c[i] >= 3 {
 		n3 := c
 		n3[i] -= 3
-		try(n3)
+		add(n3, rule.ParsedHand{Type: rule.Trio, KeyRank: idxRank(i), Length: 1})
 		for j := 0; j < rankCount; j++ { // 带一张单牌
 			if j != i && c[j] > 0 {
 				nk := n3
 				nk[j]--
-				try(nk)
+				add(nk, rule.ParsedHand{Type: rule.TrioWithSingle, KeyRank: idxRank(i), Length: 1})
 			}
 		}
 		for j := 0; j < rankCount; j++ { // 带一对
 			if j != i && c[j] >= 2 {
 				nk := n3
 				nk[j] -= 2
-				try(nk)
+				add(nk, rule.ParsedHand{Type: rule.TrioWithPair, KeyRank: idxRank(i), Length: 1})
 			}
 		}
 	}
@@ -119,12 +168,12 @@ func minHandCountDFS(c [rankCount]int, memo map[[rankCount]int]int, nodes *int) 
 	if c[i] == 4 {
 		nb := c
 		nb[i] = 0
-		try(nb)
+		add(nb, rule.ParsedHand{Type: rule.Bomb, KeyRank: idxRank(i), Length: 1})
 		if k, ok := greedySingles(c, onlyRank(i), 2); ok {
-			try(k)
+			add(k, rule.ParsedHand{Type: rule.FourWithTwo, KeyRank: idxRank(i), Length: 1})
 		}
 		if k, ok := greedyPairs(c, onlyRank(i), 2); ok {
-			try(k)
+			add(k, rule.ParsedHand{Type: rule.FourWithTwoPairs, KeyRank: idxRank(i), Length: 1})
 		}
 	}
 
@@ -134,12 +183,12 @@ func minHandCountDFS(c [rankCount]int, memo map[[rankCount]int]int, nodes *int) 
 			nw := c
 			nw[j] -= 3
 			nw[i]--
-			try(nw)
+			add(nw, rule.ParsedHand{Type: rule.TrioWithSingle, KeyRank: idxRank(j), Length: 1})
 			if c[i] >= 2 {
 				nw2 := c
 				nw2[j] -= 3
 				nw2[i] -= 2
-				try(nw2)
+				add(nw2, rule.ParsedHand{Type: rule.TrioWithPair, KeyRank: idxRank(j), Length: 1})
 			}
 		}
 		if c[j] == 4 { // 四带二 / 四带两对（锚点充当其中一张带牌）
@@ -147,14 +196,14 @@ func minHandCountDFS(c [rankCount]int, memo map[[rankCount]int]int, nodes *int) 
 			nk[j] = 0
 			nk[i]--
 			if k, ok := greedySingles(nk, onlyRank(j), 1); ok {
-				try(k)
+				add(k, rule.ParsedHand{Type: rule.FourWithTwo, KeyRank: idxRank(j), Length: 1})
 			}
 			if c[i] >= 2 {
 				np := c
 				np[j] = 0
 				np[i] -= 2
 				if k, ok := greedyPairs(np, onlyRank(j), 1); ok {
-					try(k)
+					add(k, rule.ParsedHand{Type: rule.FourWithTwoPairs, KeyRank: idxRank(j), Length: 1})
 				}
 			}
 		}
@@ -170,7 +219,7 @@ func minHandCountDFS(c [rankCount]int, memo map[[rankCount]int]int, nodes *int) 
 		for j := i; j < i+l; j++ {
 			ns[j]--
 		}
-		try(ns)
+		add(ns, rule.ParsedHand{Type: rule.Straight, KeyRank: idxRank(i+l-1), Length: l})
 	}
 
 	// 连对（长度 >=3）
@@ -183,7 +232,7 @@ func minHandCountDFS(c [rankCount]int, memo map[[rankCount]int]int, nodes *int) 
 		for j := i; j < i+l; j++ {
 			np[j] -= 2
 		}
-		try(np)
+		add(np, rule.ParsedHand{Type: rule.PairStraight, KeyRank: idxRank(i+l-1), Length: l})
 	}
 
 	// 飞机（机身长度 >=2）：不带 / 带单（贪心）/ 带对（贪心）
@@ -196,12 +245,12 @@ func minHandCountDFS(c [rankCount]int, memo map[[rankCount]int]int, nodes *int) 
 		for j := i; j < i+l; j++ {
 			nt[j] -= 3
 		}
-		try(nt)
+		add(nt, rule.ParsedHand{Type: rule.Plane, KeyRank: idxRank(i+l-1), Length: l})
 		if k, ok := greedySingles(nt, rangeRanks(i, i+l-1), l); ok {
-			try(k)
+			add(k, rule.ParsedHand{Type: rule.PlaneWithSingles, KeyRank: idxRank(i+l-1), Length: l})
 		}
 		if k, ok := greedyPairs(nt, rangeRanks(i, i+l-1), l); ok {
-			try(k)
+			add(k, rule.ParsedHand{Type: rule.PlaneWithPairs, KeyRank: idxRank(i+l-1), Length: l})
 		}
 	}
 
@@ -221,7 +270,7 @@ func minHandCountDFS(c [rankCount]int, memo map[[rankCount]int]int, nodes *int) 
 			}
 			nt[i]--
 			if k, ok := greedySingles(nt, rangeRanks(j, j+l-1), l-1); ok {
-				try(k)
+				add(k, rule.ParsedHand{Type: rule.PlaneWithSingles, KeyRank: idxRank(j+l-1), Length: l})
 			}
 			if c[i] >= 2 {
 				np := c
@@ -230,7 +279,7 @@ func minHandCountDFS(c [rankCount]int, memo map[[rankCount]int]int, nodes *int) 
 				}
 				np[i] -= 2
 				if k, ok := greedyPairs(np, rangeRanks(j, j+l-1), l-1); ok {
-					try(k)
+					add(k, rule.ParsedHand{Type: rule.PlaneWithPairs, KeyRank: idxRank(j+l-1), Length: l})
 				}
 			}
 		}
@@ -241,11 +290,10 @@ func minHandCountDFS(c [rankCount]int, memo map[[rankCount]int]int, nodes *int) 
 		nr := c
 		nr[idxBlackJoker]--
 		nr[idxRedJoker]--
-		try(nr)
+		add(nr, rule.ParsedHand{Type: rule.Rocket, KeyRank: card.RankRedJoker, Length: 1})
 	}
 
-	memo[c] = best
-	return best
+	return moves
 }
 
 // onlyRank 排除函数：仅排除单个点数

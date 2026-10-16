@@ -21,7 +21,12 @@ const ID = "ddz"
 func Register(logger *slog.Logger, botsEnabled bool) {
 	var bots *bot.Controller
 	if botsEnabled {
-		bots = bot.NewController(bot.NewEngine(logger), logger)
+		// 生产接线：叫分/加倍模型全档启用；出牌决策增强（计划器/推断层/精确残局）
+		// 只在 hard 档生效，easy/normal 保持基线行为与档位差异
+		engine := bot.NewEngine(logger).
+			WithConfig(bot.ProductionConfig()).
+			WithDifficultyConfig("hard", bot.HardPlayConfig())
+		bots = bot.NewController(engine, logger)
 	}
 	games.RegisterErrorMessages(msg.ErrorMessages)
 	games.Register(&ddzGame{bots: bots, logger: logger})

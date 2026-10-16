@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"math/rand/v2"
 	"os"
 	"testing"
@@ -19,9 +20,9 @@ type simPlayer struct {
 
 // simulateGame 用引擎完整打完一局，返回赢家座位（-1=未分出胜负）、各座位出牌次数与首次出牌前的可压回合数
 // （与真实服务端规则一致：跟牌须压过上家，连续两过开新轮，领出必出）。
-// 三座位难度独立配置：人格化参数（DefaultPersonalities）与记牌视图完整度均按座位生效，
-// 忠实镜像 Controller 的生产决策路径。
-func simulateGame(t *testing.T, eng *Engine, diffs [3]string, landlord int, rng *rand.Rand) (int, [3]int, [3]int) {
+// 三座位引擎与难度独立配置：人格化参数（DefaultPersonalities）与记牌视图完整度均按座位生效，
+// 忠实镜像 Controller 的生产决策路径；竞技场（arena_test.go）传入新旧引擎实现同牌 A/B 对战。
+func simulateGame(t *testing.T, engines [3]*Engine, diffs [3]string, landlord int, rng *rand.Rand) (int, [3]int, [3]int) {
 	t.Helper()
 
 	deck := card.NewDeck()
@@ -30,6 +31,12 @@ func simulateGame(t *testing.T, eng *Engine, diffs [3]string, landlord int, rng 
 	players := make([]*simPlayer, 3)
 	for i := range players {
 		players[i] = &simPlayer{hand: append([]card.Card(nil), deck[i*17:(i+1)*17]...)}
+	}
+	// 叫分档（与生产口径一致：地主按 17 张原始手牌叫分，最低叫 1）：供对手建模先验使用
+	// 走席位引擎，使 EnableBidModel 等叫分开关在自战/竞技场真实生效
+	landlordBid := engines[landlord].DecideBidScore(context.Background(), "sim", players[landlord].hand, 0)
+	if landlordBid < 1 {
+		landlordBid = 1
 	}
 	players[landlord].isLandlord = true
 	players[landlord].hand = append(players[landlord].hand, deck[51:]...)
@@ -74,10 +81,12 @@ func simulateGame(t *testing.T, eng *Engine, diffs [3]string, landlord int, rng 
 			UpIsLandlord:   players[up].isLandlord,
 			DownIsLandlord: players[down].isLandlord,
 			HasPlayed:      p.plays > 0,
+			LandlordBid:    landlordBid,
+			Difficulty:     diffs[cur], // 生产接线口径：引擎按档位选择出牌决策开关覆写
 			Personality:    DefaultPersonalities[diffs[cur]],
 		}
 
-		cards := eng.DecidePlay(nil, "sim", gctx)
+		cards := engines[cur].DecidePlay(nil, "sim", gctx)
 
 		if mustPlay && cards == nil {
 			t.Fatalf("领出回合决策为空：seat=%d hand=%d", cur, len(p.hand))
@@ -188,6 +197,10 @@ func TestSelfPlay_100Games(t *testing.T) {
 		t.Skip("跳过耗时自战模拟")
 	}
 	eng := newTestEngine()
+	var engines [3]*Engine
+	for i := range engines {
+		engines[i] = eng
+	}
 	diffNames := []string{"easy", "normal", "hard"}
 	type seatStat struct {
 		seats, wins int
@@ -205,7 +218,7 @@ func TestSelfPlay_100Games(t *testing.T) {
 			stats[diffs[seat]].seats++
 		}
 		landlord := game % 3
-		winner, counts, hintTurns := simulateGame(t, eng, diffs, landlord, rng)
+		winner, counts, hintTurns := simulateGame(t, engines, diffs, landlord, rng)
 		for seat, n := range counts {
 			if n > 0 {
 				continue

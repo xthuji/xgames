@@ -57,8 +57,28 @@ type GameContext struct {
 	HasPlayed      bool              // 本局已出过牌（未开张时放弃让牌配合，避免整局零出牌）
 	PassInfos      [2]PassInfo       // [0]=上家 [1]=下家：当前一轮内最近一次过牌的参照牌（手牌预估依据）
 	UnbeatenStreak int               // 本方连续跟牌让牌/无法管住对手的次数（≥2 触发拆牌重计划：拆牌压住对手夺取牌权）
+	LandlordBid    int               // 地主最终叫分档 1/2/3（对手建模先验：叫 3 = 掌权牌/炸弹密度高）；0=未注入（按中性处理）
+	Difficulty     string            // easy/normal/hard：生产接线按档位覆写出牌决策开关；空=沿用引擎配置（竞技场/单测口径）
 	handCountCache *handCountCache   // 一回合内 MinHandCount 结果缓存（内部使用，不对外暴露）
+	planCache      *planCache        // 一回合内整手计划价值缓存（EnablePlanner 门控，内部使用）
+	leadRank       *leadRankLog      // 引擎真实领出排序回记录（故意犯错次优替换用，内部使用）
 	Personality    BotPersonality    // P0: 机器人人格化参数
+	Cfg            EngineConfig      // 特性开关（Engine.DecidePlay 入口按实例配置注入）
+}
+
+// leadRankLog 引擎在通用候选段实际排序后的领出候选清单（指针字段随
+// GameContext 按值传递共享，unifiedLead 回填、DecidePlay 尾部读取）
+type leadRankLog struct {
+	cards [][]card.Card
+}
+
+// EngineConfig 引擎特性开关（A/B 竞技场与灰度上线用）：零值 = 全关 = 既有行为，
+// 保证基线可复现；每个优化 Phase 落地一个开关，决策路径按开关门控新逻辑。
+type EngineConfig struct {
+	EnablePlanner      bool // Phase 1：整手拆牌计划器（领出/跟牌按最优拆分与牌权预算择优）
+	EnableInference    bool // Phase 2/3：点数持有权概率 + 余牌形状推断 + 炸弹 EV/让牌
+	EnableExactEndgame bool // Phase 4：残局发牌分布枚举 + 精确求解替换随机 rollout
+	EnableBidModel     bool // Phase 5：叫分控制牌/炸弹非线性 + 加倍手数牌权判据
 }
 
 // BotPersonality 机器人人格化参数（P0 优化）

@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"testing"
+	"time"
 
 	"xgames/internal/games/ddz/card"
 	"xgames/internal/games/ddz/rule"
@@ -159,34 +160,48 @@ func TestFollow_TeammateSmallCardShed(t *testing.T) {
 	}
 }
 
-// TestMCTS_AttackModeNotExempted 主攻模式下队友跟牌不再豁免 MCTS；
-// 非主攻（队友 ≤2 否决）维持豁免
+// TestMCTS_AttackModeNotExempted 主攻模式下队友跟牌不再豁免残局搜索；
+// 非主攻（队友 ≤2 否决）维持豁免。
+// 接管断言走 mctsDecidePlay（给充足截止时间）而非 mctsEnhancedPlay：
+// 后者带 400ms 墙钟预算，在 -race + 并行测试的 CPU 抢占下会假性超时。
 func TestMCTS_AttackModeNotExempted(t *testing.T) {
 	t.Parallel()
 
+	hand := cards("4 K 5 6 7")
 	attackCtx := GameContext{
-		Hand:           cards("4 K 5 6 7"),
+		Hand:           hand,
 		RecentPlays:    [2]PlayRecord{play("3", false), {}},
 		CanBeat:        true,
-		PlayerCounts:   [2]int{10, 9},
+		PlayerCounts:   [2]int{3, 4}, // 队友（上家）3 张、地主（下家）4 张
 		DownIsLandlord: true,
-		RemainingCards: fullRemaining(),
-		HasPlayed:      true,
+		// 精确小分布视图（共 7 张未知）：走确定性的发牌分布求解
+		RemainingCards: viewOf(hand, map[card.Rank]int{
+			card.Rank3: 1, card.Rank4: 1, card.Rank6: 1,
+			card.Rank7: 1, card.Rank8: 1, card.Rank9: 1, card.Rank10: 1,
+		}),
+		HasPlayed: true,
+		Cfg:       EngineConfig{EnableExactEndgame: true},
 	}
 	if !farmerUpperAttackMode(attackCtx) {
 		t.Fatal("测试前置失败：该上下文应处于主攻模式")
 	}
-	if got, _ := mctsEnhancedPlay(attackCtx); got == nil {
-		t.Error("主攻模式下队友跟牌不应豁免 MCTS，应接管出牌")
+	if mctsExempted(attackCtx) {
+		t.Error("主攻模式下队友跟牌不应豁免残局搜索")
+	}
+	if got, _ := mctsDecidePlay(attackCtx, time.Now().Add(5*time.Second)); got == nil {
+		t.Error("主攻模式应被搜索接管出牌，实际未给出结果")
 	}
 
 	// 对照：队友 ≤2 张（主攻被否决）→ 维持豁免，交还规则引擎配合逻辑
 	vetoCtx := attackCtx
-	vetoCtx.PlayerCounts = [2]int{2, 9}
+	vetoCtx.PlayerCounts = [2]int{2, 4}
 	if farmerUpperAttackMode(vetoCtx) {
 		t.Fatal("测试前置失败：队友 ≤2 张应否决主攻模式")
 	}
-	if got, _ := mctsEnhancedPlay(vetoCtx); got != nil {
-		t.Errorf("非主攻的队友跟牌应豁免 MCTS，却被接管出 %s", cardsToStr(got))
+	if !mctsExempted(vetoCtx) {
+		t.Error("非主攻的队友跟牌应豁免残局搜索")
+	}
+	if got, _, _ := mctsEnhancedPlay(context.Background(), vetoCtx); got != nil {
+		t.Errorf("非主攻的队友跟牌应豁免搜索，却被接管出 %s", cardsToStr(got))
 	}
 }

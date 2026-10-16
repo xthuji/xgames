@@ -1,9 +1,11 @@
 package bot
 
 import (
+	"context"
 	"math"
 	"math/rand/v2"
 	"sync"
+	"time"
 
 	"xgames/internal/games/ddz/card"
 	"xgames/internal/games/ddz/rule"
@@ -13,10 +15,10 @@ import (
 // 每个节点代表一个游戏状态（手牌 + 最近出牌），存储访问次数和胜利次数，
 // 用 UCB1 公式平衡探索与利用。
 type mctsNode struct {
-	cards   []card.Card // 该节点对应的出牌候选
-	visits  int         // 访问次数
-	wins    int         // 胜利次数（rollout 中自己走完的次数）
-	parent  *mctsNode   // 父节点（根节点为 nil）
+	cards    []card.Card // 该节点对应的出牌候选
+	visits   int         // 访问次数
+	wins     int         // 胜利次数（rollout 中自己走完的次数）
+	parent   *mctsNode   // 父节点（根节点为 nil）
 	children []*mctsNode // 子节点
 }
 
@@ -80,9 +82,16 @@ func getMctsIterations(gctx GameContext) int {
 	}
 }
 
-// mctsDecidePlay 用 UCT 树搜索决定出牌（残局增强）。
-// 返回最优候选与其真实模拟胜率（winRate ∈ [0,1]；候选唯一未模拟时为 -1）。
-func mctsDecidePlay(gctx GameContext) ([]card.Card, float64) {
+// mctsDecidePlay 用残局搜索决定出牌（残局增强）。
+// EnableExactEndgame 且记牌视图完整时走精确求解（发牌分布枚举 + 完全信息最优
+// 博弈，endgame.go）；不适用或全分布未收敛时回落 UCT + 随机 rollout。
+// 返回最优候选与其胜率（winRate ∈ [0,1]；候选唯一未搜索时为 -1）。
+func mctsDecidePlay(gctx GameContext, deadline time.Time) ([]card.Card, float64) {
+	if exactEndgameUsable(gctx) {
+		if cards, wr, ok := exactEndgamePlay(gctx, deadline); ok {
+			return cards, wr
+		}
+	}
 	hand := gctx.Hand
 	var candidates [][]card.Card
 
@@ -136,6 +145,10 @@ func mctsDecidePlay(gctx GameContext) ([]card.Card, float64) {
 	var mu sync.Mutex     // 保护树节点更新的互斥锁
 
 	for batch := 0; batch < iterations; batch += batchSize {
+		// 预算保护：超出残局搜索截止时间提前收束（至少完成一批，保证有可用胜率）
+		if batch > 0 && time.Now().After(deadline) {
+			break
+		}
 		currentBatch := batchSize
 		if batch+currentBatch > iterations {
 			currentBatch = iterations - batch
@@ -144,8 +157,8 @@ func mctsDecidePlay(gctx GameContext) ([]card.Card, float64) {
 		// 并行执行一批模拟
 		var wg sync.WaitGroup
 		results := make([]struct {
-			node   *mctsNode
-			won    bool
+			node *mctsNode
+			won  bool
 		}, currentBatch)
 
 		for i := 0; i < currentBatch; i++ {
@@ -313,43 +326,37 @@ func dealOpponentHands(unknown [rankCount]int, upCount, downCount int) (upHand, 
 	return upHand, downHand
 }
 
-// mctsQuickPlay rollout 阶段的简化出牌策略：
-// MustPlay 时选最小合法牌型；跟牌时选最小能压过的
+// mctsQuickPlay rollout 阶段的快速出牌策略（计划 §Phase 4 升级）：
+// 领出取"降幅最大（一次处理掉最多张）→ 剩余手数最少 → 点数最小"的整组
+// （不拆结构、不动炸弹），跟牌取最小同路可压——提高未收敛叶子的估值质量
+// （旧策略只看点数最小，常拆散顺子/连对导致 rollout 系统性低估残局水平）。
 func mctsQuickPlay(hand []card.Card, mustPlay bool, target rule.ParsedHand) []card.Card {
-	if mustPlay {
-		// 领出：生成所有合法牌型，选最小点数的
-		var minCards []card.Card
-		minScore := 1 << 30
-		for _, h := range rule.GenerateHints(hand, rule.ParsedHand{}) {
-			if isBombLike(h.Cards) {
-				continue
-			}
-			s := sumRank(h.Cards)
-			if s < minScore {
-				minScore = s
-				minCards = h.Cards
-			}
-		}
-		return minCards
+	if len(hand) == 0 {
+		return nil
 	}
-
-	// 跟牌：选最小能压过的
-	var minBeat []card.Card
-	minScore := 1 << 30
-	for _, h := range rule.GenerateHints(hand, target) {
-		if !beatsTarget(h.Cards, target) {
+	last := rule.ParsedHand{}
+	if !mustPlay {
+		last = target
+	}
+	handCounts := handToCounts(hand)
+	bestSize, bestAfter, bestSum := -1, 1<<30, 1<<30
+	var best []card.Card
+	for _, h := range rule.GenerateHints(hand, last) {
+		if isBombLike(h.Cards) || breaksBomb(hand, h.Cards) || breaksRocket(hand, h.Cards) {
+			continue // rollout 不动炸弹/王炸（与旧口径一致，保持搜索开销可控）
+		}
+		if !mustPlay && !beatsTarget(h.Cards, target) {
 			continue
 		}
-		if isBombLike(h.Cards) {
-			continue
-		}
+		after := MinHandCount(subtractCounts(handCounts, handToCounts(h.Cards)))
 		s := sumRank(h.Cards)
-		if s < minScore {
-			minScore = s
-			minBeat = h.Cards
+		n := len(h.Cards)
+		if n > bestSize || (n == bestSize && after < bestAfter) ||
+			(n == bestSize && after == bestAfter && s < bestSum) {
+			best, bestSize, bestAfter, bestSum = h.Cards, n, after, s
 		}
 	}
-	return minBeat
+	return best
 }
 
 // parseCards 将 []card.Card 解析为 ParsedHand（用于跟牌判断）
@@ -369,29 +376,57 @@ func subtractHand(hand, played []card.Card) []card.Card {
 
 // --- 主决策集成 ---
 
-// mctsEnhancedPlay 残局 MCTS 出牌决策入口。
-// 优先级：残局 MCTS > 规则引擎；返回出牌候选与真实模拟胜率，不接管时返回 nil。
-// 例外：MCTS 模拟不区分队友与对手（随机发牌均为敌人视角），
-// 会无视规则引擎的农民配合约束，以下场景不接管：
+// mctsExempted 搜索豁免判定（上述两类配合/死封场景交还规则引擎）
+func mctsExempted(gctx GameContext) bool {
+	if lastPlayByTeammate(gctx) && gctx.HasPlayed && !farmerUpperAttackMode(gctx) {
+		return true
+	}
+	if minOpponentCount(gctx) <= 2 && isFarmerUpperSeat(gctx) {
+		return true
+	}
+	return false
+}
+
+// mctsEnhancedPlay 残局搜索出牌决策入口。
+// 优先级：残局搜索 > 规则引擎；返回出牌候选、胜率与是否超时，不接管时返回 nil。
+// 搜索整体受 endgameSearchBudget 预算约束（文档 §10.2 超时保护）：超时返回
+// (nil, 0, true)，调用方回退规则引擎并记 Warn 日志。
+// 例外：搜索不区分队友与对手（随机发牌/分布枚举均为敌视角），
+// 以下场景不接管：
 //   - 队友出牌后的跟牌：须执行"不压队友大牌/让牌送队友/接应小牌"配合；
 //     但农民上家主攻模式除外——主攻以自己走完为第一路径，
 //     rollout 为三席位阵营判定，"压队友抢跑"只有在对阵营有利时才获高胜率，
 //     可放心放开接管（见 docs/bots/ddz-bot.md §5.4/§5.5）
-//   - 农民上家残局死封（对手 ≤2 张）：须用最强牌型一次性封堵，模拟胜率
+//   - 农民上家残局死封（对手 ≤2 张）：须用最强牌型一次性封堵，搜索胜率
 //     难以体现死封的战略价值，常误出小牌放走对手
-func mctsEnhancedPlay(gctx GameContext) ([]card.Card, float64) {
-	if lastPlayByTeammate(gctx) && gctx.HasPlayed && !farmerUpperAttackMode(gctx) {
-		return nil, 0
+func mctsEnhancedPlay(ctx context.Context, gctx GameContext) ([]card.Card, float64, bool) {
+	if mctsExempted(gctx) {
+		return nil, 0, false
 	}
-	if minOpponentCount(gctx) <= 2 && isFarmerUpperSeat(gctx) {
-		return nil, 0
+	// 残局触发搜索
+	if !shouldUseMCTS(gctx) {
+		return nil, 0, false
 	}
-	// 残局触发 MCTS
-	if shouldUseMCTS(gctx) {
-		if mctsResult, winRate := mctsDecidePlay(gctx); mctsResult != nil {
-			// 用 MCTS 结果覆盖规则引擎（仅残局）
-			return mctsResult, winRate
-		}
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return nil, 0 // 返回 nil 表示不接管，由调用方走规则引擎路径
+	runCtx, cancel := context.WithTimeout(ctx, endgameSearchBudget)
+	defer cancel()
+	deadline := time.Now().Add(endgameSearchBudget)
+
+	type outcome struct {
+		cards []card.Card
+		wr    float64
+	}
+	ch := make(chan outcome, 1)
+	go func() {
+		cards, wr := mctsDecidePlay(gctx, deadline)
+		ch <- outcome{cards, wr}
+	}()
+	select {
+	case o := <-ch:
+		return o.cards, o.wr, false
+	case <-runCtx.Done():
+		return nil, 0, true // 超时：不接管，由调用方走规则引擎
+	}
 }

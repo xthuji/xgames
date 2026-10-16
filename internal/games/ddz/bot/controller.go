@@ -71,6 +71,7 @@ type gameTrack struct {
 	passes     map[string]rule.ParsedHand           // playerID → 当前一轮内其过牌时未压过的牌（过牌推理素材）
 	cumPasses  map[string]map[rule.HandType]card.Rank // playerID → {牌型: 最高KeyRank} 累积过牌声明（跨轮次持久化）
 	stuck      map[string]int                       // botID → 连续让牌/无法管住对手的次数（拆牌重计划触发依据）
+	landlordBid  int                               // 地主最终叫分档 1/2/3（对手建模先验，来自 LandlordPayload.Multiplier）
 	passStreak int                        // 连续过牌数（达 2 后下一个出牌即开启新一轮）
 	bombNum    int                        // 累计炸弹数（含火箭）
 	difficulty string                     // easy/normal/hard：决定人格化参数和记牌视图完整度
@@ -199,6 +200,7 @@ func (c *Controller) onGameStart(roomCode string, p protocol.GameStartPayload) {
 func (c *Controller) onLandlord(roomCode string, p msg.LandlordPayload) {
 	c.withTrack(roomCode, func(gt *gameTrack) {
 		gt.landlordID = p.PlayerID
+		gt.landlordBid = p.Multiplier // 叫分档（加倍前的底倍 = 最高叫分）
 		gt.bottom = msg.InfosToCards(p.BottomCards)
 		gt.counts[p.PlayerID] += 3
 		if _, ok := gt.bots[p.PlayerID]; ok {
@@ -447,9 +449,10 @@ func (c *Controller) buildContextLocked(gt *gameTrack, playerID string, mustPlay
 		}
 	}
 
+	hand := append([]card.Card(nil), gt.hands[playerID]...)
 	return GameContext{
 		IsLandlord:     playerID == gt.landlordID,
-		Hand:           append([]card.Card(nil), gt.hands[playerID]...),
+		Hand:           hand,
 		BottomCards:    append([]card.Card(nil), gt.bottom...),
 		RecentPlays:    gt.recent,
 		MustPlay:       mustPlay,
@@ -462,7 +465,10 @@ func (c *Controller) buildContextLocked(gt *gameTrack, playerID string, mustPlay
 		HasPlayed:      gt.oncePlayed[playerID],
 		PassInfos:      [2]PassInfo{passInfoOf(gt, upID), passInfoOf(gt, downID)},
 		UnbeatenStreak: gt.stuck[playerID],
+		LandlordBid:    gt.landlordBid, // 对手建模先验（叫 3 = 掌权牌/炸弹密度高）
+		Difficulty:     gt.difficulty, // 生产接线：hard 档启用出牌决策增强，easy/normal 沿用基线
 		handCountCache: newHandCountCache(), // 每回合新建缓存，复用 MinHandCount 计算结果
+		planCache:      newPlanCache(unknownCounts(remaining, hand)), // 整手计划缓存（EnablePlanner 门控使用）
 		Personality:    gt.personality,       // P0: 注入人格化参数
 	}
 }

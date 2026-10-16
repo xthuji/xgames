@@ -162,6 +162,9 @@ Room 广播消息 → Controller.OnBroadcast/OnTargeted
        ├─ CumPasses：跨轮次累积过牌声明 {牌型: 最高KeyRank}
        ├─ UnbeatenStreak：连续让牌/管不住对手的次数（≥2 触发拆牌重计划）
        ├─ handCountCache：回合内 MinHandCount 结果缓存（命中率 >80%）
+       ├─ planCache：回合内整手拆牌计划价值缓存（EnablePlanner 门控）
+       ├─ LandlordBid：地主叫分档（对手建模先验，来自 LandlordPayload.Multiplier）
+       ├─ Difficulty：本局档位（引擎据此选择出牌决策开关覆写）
        └─ Personality：BotPersonality 参数（Aggression/Risk/Cooperation/Mistake）
     → Engine.DecidePlay（三级结构，见 §5.1）
     → 提交 MsgPlayCards/MsgPass
@@ -179,7 +182,10 @@ Room 广播消息 → Controller.OnBroadcast/OnTargeted
 - RemainingCards（记牌视图）、PlayedBombs
 - UpIsLandlord/DownIsLandlord（农民角色定位）
 - HasPlayed、PassInfos[2]、UnbeatenStreak
+- LandlordBid（叫分档先验）、Difficulty（档位 → 出牌决策开关覆写）
 - Personality（人格化参数）
+- Cfg（本次决策生效的 EngineConfig 特性开关，由 DecidePlay 入口注入）
+- handCountCache / planCache（回合内缓存，随上下文副本丢弃）
 
 ### 3.3 人格化难度系统
 
@@ -202,9 +208,30 @@ Room 广播消息 → Controller.OnBroadcast/OnTargeted
 | CooperationWeight | 0.9（稍弱） | 1.0（标准） | 1.3（强配合） |
 | MistakeProbability | 0.12（12%） | 0.03（3%） | 0.0（0%） |
 
-所有难度**共用同一套出牌策略**（`unifiedPlay`），差异只体现在两处：
+所有难度**共用同一套出牌策略**（`unifiedPlay`），差异体现在三处：
 1. **记牌视图完整度**：Controller 构造 RemainingCards 时，normal 仅跟踪 A/2/大小王，hard 全量 15 点数；缺失点数按"未知"保守处理（信息越少决策越保守）
 2. **故意犯错概率**：easy/normal 在领出回合以一定概率替换次优候选
+3. **出牌决策增强开关**：仅 hard 档启用（`EngineConfig`，见下），easy/normal 保持基线决策路径
+
+#### 特性开关与生产接线（engine.go: EngineConfig）
+
+决策增强按开关门控，**零值 = 全关 = 基线行为**，保证任何阶段都可复现旧版本并单独归因收益：
+
+| 开关 | 落地能力 | 详见 |
+|------|---------|------|
+| EnablePlanner | 整手拆牌计划器（领出/跟牌按最优拆分与牌权预算择优） | §6.4 |
+| EnableInference | 点数持有权概率 + 余牌形状推断 + 炸弹 EV + 让牌 | §6.5 |
+| EnableExactEndgame | 残局发牌分布枚举 + 完全信息精确求解 | §6.6 |
+| EnableBidModel | 叫分控制牌/炸弹非线性 + 加倍手数牌权判据 | §6.3 |
+
+生产接线（`game.go: Register`）分两层，避免共享引擎实例的跨房间数据竞争：
+
+- **引擎级** `ProductionConfig()`：只开 `EnableBidModel`。叫分/加倍不依赖记牌视图、不构成档位差异，且基线"强度过阈值即加倍"在地主 20 张手牌上恒真（实测加倍率 100%），属于全档修复
+- **档位级** `WithDifficultyConfig("hard", HardPlayConfig())`：hard 档出牌增强全开；`Engine.playConfig(gctx.Difficulty)` 在 `DecidePlay` 入口解析生效开关并注入 `gctx.Cfg`（按值传递，仅影响本次决策链）。easy/normal 不在覆写表中 → 沿用引擎级配置（出牌开关全关），档位差异不被抹平
+
+真人挂机托管（`session/ai_play.go`）自建全量记牌视图，与专家档等价，故显式传 `Difficulty: "hard"` 同步启用增强。
+
+竞技场（`bot/arena_test.go`）不依赖档位表：按实例 `WithConfig` 配置，`gctx.Difficulty` 为空时直接沿用引擎配置，A/B 口径与生产接线互不干扰。
 
 #### 故意犯错机制（personality.go: intentionalImperfection）
 
@@ -326,15 +353,16 @@ UCB1 选择公式（C=√2）：`exploit = wins/visits`，`explore = C·√(ln(p
 ### 5.1 决策入口（engine.go: DecidePlay 三级结构）
 
 ```
-DecidePlay(gctx)
+DecidePlay(ctx, gctx)
+  ├─ [0] 注入生效开关：gctx.Cfg = playConfig(gctx.Difficulty)（§3.3），必要时补建 planCache
   ├─ [1] P0 硬规则 immediateWinPlay()（strategy.go）
-  │     存在一步清空手牌的出法 → 直接返回，优先于 MCTS 与一切策略
+  │     存在一步清空手牌的出法 → 直接返回，优先于残局搜索与一切策略
   │     ├─ 领出：整手牌恰为一个合法牌型 → 打出整手
   │     └─ 跟牌：存在能压过上家且恰好清空手牌的候选 → 打出
-  ├─ [2] mctsEnhancedPlay() → 残局 MCTS 接管（见 §5.5）
-  │     豁免场景返回 nil，落到规则引擎
+  ├─ [2] mctsEnhancedPlay(ctx, gctx) → 残局搜索接管（见 §5.5）
+  │     400ms 搜索预算（EnableExactEndgame）；豁免场景/超时返回 nil 落到规则引擎
   ├─ [3] unifiedPlay() → 规则引擎（领出 unifiedLead / 跟牌 unifiedFollow）
-  ├─ [4] 故意犯错（仅领出 + 未走 MCTS + MistakeProbability>0）
+  ├─ [4] 故意犯错（仅领出 + 未走搜索 + MistakeProbability>0）
   ├─ [5] MustPlay 兜底 → 最小单张（禁止返回 nil，避免服务端拒收导致回合卡死）
   └─ [6] 记录 DecisionLog → replay.Logger
 ```
@@ -353,18 +381,23 @@ unifiedLead(gctx)
   ├─ [4] 残局冲刺：手数 ≤3 且敌方/队友均 >2 张 → sprintLead()（见 §5.6）
   ├─ [5] 残局死封：minOpponentCount ≤ 2 && 农民上家 → biggestSingleOrPair()
   ├─ [6] 送队友：队友 ≤ 2 张且地主不危急 → pickRunCard() 领小牌送权
+  ├─ [6.5] 形状死封（EnableInference）：农民上家 && 对手 ≤6 张 → shapeBlockLead()
+  │     按对手余牌形状权重避开其最可能的收尾路径（§6.5，死封窗口从 ≤2 扩展到 ≤6）
   ├─ [7] 局势化三分支
-  │     ├─ 对手 ≤ 5张 → pickCautiousLead() 谨慎控牌
+  │     ├─ 对手 ≤ 5张 → pickCautiousLead() 谨慎控牌（硬短路，任何配置保留）
   │     ├─ 地主 || 农民且下家是队友 → pickFastShed(allowSmall=true)
   │     └─ 农民上家 && 对手 > 10张 → pickFastShed(allowSmall=false) 防跟跑
+  │     ※ EnablePlanner 且计划就绪时跳过规则 3/4 的局部快跑启发（改由 [9] 全局择优）
   ├─ [8] 角色分工
   │     ├─ 地主下家（跑牌位）→ pickRunCard()
   │     └─ 地主上家（顶牌位）→ 主攻模式 ? pickRunCardFiltered(过滤掌权牌)
   │                              : pickBlockCard()（见 §5.4）
   ├─ [9] 通用候选评估
   │     过滤: 不拆炸弹/王炸, 出后手数必须 -1
-  │     四维排序: wins(预估胜出) > split(拆牌代价) < power(掌权消耗) < score
-  │     潜在炸弹预警: 裸 Q+ 大单/对降级 fallback
+  │     排序: inPlan(计划内首步) > planKey(组值升序) > wins(预估胜出)
+  │           > split(拆牌代价) < power(掌权消耗) < score
+  │     潜在炸弹预警: 二元版裸 Q+ 大单/对降级 fallback；
+  │                   EnableInference 换为超几何持炸概率 > 0.25 才降级（§6.5）
   └─ [10] 兜底 fallbackLead() → 面值最小整组
 ```
 
@@ -393,10 +426,12 @@ unifiedFollow(gctx)
   ├─ [3] 跑牌方积极跟牌：地主 || 地主下家 || 冲刺 + 目标 ≤J → pickShedFollow()
   │     （允许消耗 Q/K/A，2/王保留）
   ├─ [4] 通用候选评估
-  │     过滤: 可压性验证 / 炸弹使用条件 / 不拆炸弹/王炸 / 手数
+  │     过滤: 可压性验证 / 炸弹使用条件（EV 判定，§5.5/§6.5）/ 不拆炸弹/王炸 / 手数
   │     多牌型目标放宽: 顺子/连对/飞机族允许拆 ≤1 组进入择优（见下）
   │     掌权保护: 非胜出不压 ≤10 小牌（UnbeatenStreak≥2 或主攻或冲刺时放开）
-  │     排序: control(预估胜出) > after(手数) < score
+  │     让牌 tank（EnableInference+EnablePlanner，候选数 ≤8）：压这手的计划代价
+  │       超过 2 个牌权且非危急/非重计划/非冲刺/非顶牌位 → 直接 pass（§6.4）
+  │     排序: control(预估胜出) > after(手数) < score < planV(剩余计划评分，平手比)
   └─ [5] 未开张兜底：HasPlayed=false → anyBeat() 不计代价先出一手
 ```
 
@@ -405,7 +440,8 @@ unifiedFollow(gctx)
 - **多牌型目标放宽**：目标为顺子/连对/飞机族（`isMultiTypeTarget`）时，`after > current` 的候选不直接丢弃，允许拆散至多 1 组对子/三条（`splitPenalty ≤ 1`）进入择优。设计依据：对手一手可走 5 张以上，放行的节奏价值（P2）高于我方拆 1 组的结构代价（P3）。护栏：不拆炸弹/王炸、掌权牌保护维持不变。
 - **拆牌重计划（replan）**：`UnbeatenStreak >= 2`（连续管不住对手）或对手 ≤5 张时，原出牌计划已失效——跳过手数过滤、放开 Q/K/A 掌权保护（2/王仍保留），允许拆散对子/三条/顺子压住对手夺回牌权。
 - **掌权牌保护**：非预估胜出时不用 Q/K/A/2 压 ≤10 的小牌；`UnbeatenStreak ≥ 2` 时放开 Q/K/A；主攻模式时 Q/K/A 放宽为夺权资源（§5.4）；冲刺模式整体跳过保护（§5.6）；2/王在任何情况下都保留为收权底牌。
-- **炸弹使用时机（shouldUseBomb）**：对手危急 / 炸完即可走完 / 手牌 ≤5 张三种场景才动用炸弹。
+- **炸弹使用时机（shouldUseBomb）**：三条硬触发短路（对手危急 / 炸完即走 / 手牌 ≤5 张）后转 EV 判定：对手一手走完概率、炸后计划手数与预期牌权覆盖、队友临门时不压队友、王炸保留预算（§6.5）。
+- **计划一致性（EnablePlanner）**：跟牌平手时比“压完后剩余手牌的最优拆牌计划评分”，与领出的计划内首步优先同一口径（§6.4）；仅在候选数 ≤8 时启用，避免逐候选计划搜索爆炸。
 - **接应队友（pickReliefBeat）**：不拆炸弹、出牌后手数不增，优先与队友同路（单接单、对接对），无同路再放宽到任意可压候选——目标是"接住队友的牌权再送回阵营"。
 - **过牌推理（noBeatFromPass）**：对手曾对参照牌过牌 → 推断其没有同路更大的牌；优先单轮信息，否则用累积声明。
 
@@ -446,29 +482,36 @@ farmerUpperAttackMode(gctx) bool
 - **下家职责不变**：地主下家（跑牌位）行为完全不动；动态指派目前仅限上家
 - **难度无关**：所有难度共用主攻判定（与 unifiedPlay 的"难度只体现在记牌视图完整度"原则一致）；normal 难度视图缺失时 A3/A4 按未知保守处理，A1/A2 不受影响
 
-### 5.5 MCTS 残局增强（mcts.go）
+### 5.5 残局搜索增强（mcts.go + endgame.go）
 
 **触发条件（shouldUseMCTS）**：自己手牌 ≤5 张，或任一对手 ≤3 张。
 
-**豁免场景（mctsEnhancedPlay，不接管、交还规则引擎）**：
-- 队友出牌后的跟牌：须执行农民配合约束——**农民上家主攻模式除外**（主攻以自己走完为第一路径，且 rollout 为三席位阵营判定，"压队友抢跑"只有在对阵营有利时才获高胜率）
-- 农民上家残局死封（对手 ≤2 张）：须用最强牌型一次性封堵，模拟胜率难以体现死封的战略价值
+**入口与预算（mctsEnhancedPlay）**：`mctsDecidePlay` 在 `context.WithTimeout(400ms)`（`endgameSearchBudget`）下执行；
+超时或结果不可用时返回 `timedOut`，由 `Engine.DecidePlay` 回退规则引擎并记 Warn 日志——单步决策总耗时上限因此可控（拟人延迟 1~3s 不变）。
+
+**接管优先级**：`exactEndgameUsable` 成立时先走精确残局求解（§6.6），否则回到 UCT rollout；
+未收敛时一律不接管（不把猜测的胜率当成决策依据）。
+
+**豁免场景（mctsExempted，不接管、交还规则引擎）**：
+- 队友出牌后的跟牌：须执行农民配合约束——**农民上家主攻模式除外**（主攻以自己走完为第一路径，且搜索为三席位阵营判定，"压队友抢跑"只有在对阵营有利时才获高胜率）
+- 农民上家残局死封（对手 ≤2 张）：须用最强牌型一次性封堵，胜率难以体现死封的战略价值
 
 **UCT 搜索流程（mctsDecidePlay）**：
 
 ```
-1. 生成候选（领出: 全部合法牌型，排除炸弹类; 跟牌: 能压过目标的）
-2. P0 预筛：存在清空手牌的候选直接返回（immediateWinPlay 的双保险）
-3. 构建 UCT 树: root.children = 各候选节点
-4. 主循环 (batch=100, total=200~1000)：并行 rollout + 批量回传
-5. 选胜率最高的子节点，返回真实模拟胜率（winRate ∈ [0,1]，记入日志观测）
+1. 精确残局可用且接管成功 → 直接返回分布加权胜率选出的候选（§6.6）
+2. 生成候选（领出: 全部合法牌型，排除炸弹类; 跟牌: 能压过目标的）
+3. P0 预筛：存在清空手牌的候选直接返回（immediateWinPlay 的双保险）
+4. 构建 UCT 树: root.children = 各候选节点
+5. 主循环 (batch=100, total=200~1000)：并行 rollout + 批量回传；每批开始前检查截止时间，超预算提前收敛
+6. 选胜率最高的子节点，返回真实模拟胜率（winRate ∈ [0,1]，记入日志观测）
 ```
 
 **三席位阵营 rollout（mctsSimulateWin）**——模拟贴近真实规则：
 
 - 从 unknown 牌池按上/下家**真实余牌数**（`PlayerCounts[2]`）分别发牌，三席位轮转出牌（我 → 下家 → 上家）
 - 农民视角：一席队友、一席地主；地主视角：两席均为敌人
-- 领出权被压时正确移交，连续两过开新轮；rollout 出牌策略沿用 `mctsQuickPlay`（领出最小合法组、跟牌最小可压组，不动用炸弹）
+- 领出权被压时正确移交，连续两过开新轮；rollout 出牌策略用 `mctsQuickPlay`（一次处理张数最多 → 剩余手数最少 → 点数和最小的整组降幅启发式，不动用炸弹）
 - **阵营胜负判定**：农民 = 任一非地主走完记胜；地主 = 自己走完记胜、任一农民走完记负——搜索目标与 P1 阵营配合对齐
 - 步数上限随全场剩余牌数自适应（`rolloutPlayCap`），未分胜负时剩余牌少的一方阵营判胜
 
@@ -565,9 +608,116 @@ minHandCountDFS(c, memo, nodes):
 
 **结构加分**：手数节省 `saved = len(hand) - MinHandCount(hand)`，每节省一手 +0.3；最长连续 ≥5 +1.0（顺子潜力），≥10 +1.5。
 
-**叫分阈值**：≥7.5→3分，≥5.5→2分，≥3.5→1分，≥4.5→加倍。
+**叫分阈值**：≥7.5→3分，≥5.5→2分，≥3.5→1分，≥4.5→加倍（以上为基线口径，关闭 EnableBidModel 时生效）。
 
-### 6.4 候选生成与带牌小牌化（rule/hints.go）
+#### 叫分/加倍模型（EnableBidModel，handStrengthV2 / shouldDoubleV2）
+
+基线口径的两处偏差：**不看控制牌的绝对兑现能力**（3 张 2 与 1 张 2 同分），且
+“强度过 4.5 即加倍”在地主 20 张手牌上恒真（实测加倍率 100%，几乎每手都加）。
+新模型在不改动结构因子的前提下叠加三项，并重定加倍判据：
+
+| 因子 | 函数 | 计分 |
+|------|------|------|
+| 绝对控制组数 | `absoluteControls` | 大王 1 组 / 王炸再 1 组 / 单小王 0.5 组 / 2 按张数封顶 3 组 / 自占 3 张 2 时 A 升级 1 组；按 0.6 权重计入强度 |
+| 炸弹非线性 | `bombScoreV2` | 第 1 炸 +3、第 2 炸起 +4（两手并一手的兜现确定性递增） |
+| 断点修复 | `gapBonus` | 极大连子恰 4 张（如 9 10 J Q 缺 8/K）按 0.5 手潜力计，上限 1.0 |
+
+**加倍判据（shouldDoubleV2）**：炸弹 ≥2 直接加；否则要求“能一波走”——手数 ≤4 且
+绝对控制组数 ≥ 手数-1（每一手都有牌权回收才敢把分翻倍）。
+
+**阈值标定**：强度分布因控制牌/炸弹非线性整体上移（17 张随机手牌 p50 从 6.1 到 7.4），
+按 6 万手随机发牌的分位定阈（p45/p75/p90 = 7.1/8.8/11.8）：
+
+| 档位 | 基线分布 | 新模型分布 | 人工参考 |
+|------|----------|------------|----------|
+| 不叫 | 0.7% | 44.8% | ≈45% |
+| 叫 1 | 32.2% | 30.1% | ≈30% |
+| 叫 2 | 45.1% | 15.2% | ≈15% |
+| 叫 3 | 22.1% | 10.0% | ≈10% |
+| 加倍率 | 100% | 4.4% | “能一波走/有炸才加” |
+
+一圈全不叫由服务端流局重发兜底（`session/bid.go: redeal`，连续 maxRedeals 次后强制指定地主）。
+
+### 6.4 整手拆牌计划器（handplan.go，EnablePlanner）
+
+真人思维的第一步是“这手牌拆成哪几组、能收几次牌权”。纯手数贪心（MinHandCount）不区分
+“手少但无收权牌”与“手多但每手都能自己收回”，计划器在同一个搜索空间上改用价值函数：
+
+```
+planDFS(c, unknown, memo, nodes)          // 与 minHandCountDFS 对称，共用 enumerateMoves
+  每步锚定剩余最小点数枚举合法组（单/对/三/带牌/顺/连对/飞机/炸/火箭）
+  价值和 = 本组贡献 planGroupValue + 递归剩余；记忆化，空手牌 = 0
+
+planGroupValue(unknown, ph) =
+    -planCostPerHand(10)                     每一手出牌机会的成本
+    +planControlBonus(8)   若 sprintControl(ph, unknown)  绝对掌权组（未知池无更大同路）
+    -planSmallSinglePen(2) 若 单张组且点数 ≤9   暴露小单张
+    -planSmallPairPen(3)   若 对子组且点数 ≤9   暴露小对子
+```
+
+- **备选计划首步集**：`planCache.firstStepCovered` 用容差 `planCoverMargin=4`（约半手）判定
+  “本组价值 + 剩余最优计划 ≥ 全手最优 - 容差”，即评分 Top-N 拆分的首步集合；等价于
+  保留多个备选计划而不只取唯一最优，避免一手定死后续无变通。
+- **保守下界**：节点上限 `maxPlanNodes=20000` 超限时返回全单张分解估值（`planAllSinglesValue`，不写缓存）。
+- **接入点**（见 §5.2/§5.3）：领出候选排序首键改为“在计划内 → 组值升序（先出最难守的组，
+  掌权组留作收权）”，再回落到原有 wins/split/power/score；跟牌在 control/after/score 全平时
+  比“压完后剩余手牌的最优计划评分”。P0/P1 硬规则（一手清空、死封、送队友、冲刺）保持前置短路。
+- **缓存**：`planCache` 按计数数组键值，未知池在同回合固定；Controller 每回合新建，直接调
+  `DecidePlay` 的路径由 `ensurePlanCache` 从记牌视图现场推导。
+- **降级**：easy/normal 记牌视图缺失点数（unknown=-1）时 `sprintControl` 判不成立 → 掌权加分
+  为 0，计划退回纯手数最优（与基线同向），不产生虚假乐观。
+
+### 6.5 对手推断层（inference.go，EnableInference）
+
+把记牌视图的“哪些牌还没出现”升级为“牌在哪家手上、那家下一手想走什么”。
+先验可解释、不训练、不跨局持久化。
+
+| 能力 | 函数 | 要点 |
+|------|------|------|
+| 叫分先验 | `GameContext.LandlordBid` | Controller 从 `LandlordPayload.Multiplier` 记录地主叫分档；叫 3 → 地主持炸/掌权牌密度上调，叫 1 → 下调 |
+| 持炸概率 | `bombHoldProb` / `bombThreatProb` | 未现 4 点的点数集中于对手座位的超几何概率（`combSmall` 手写，不引外部库）；取代 `potentialBombRanks` 的全有/全无二元判断，阈值 `bombProbThreshold=0.25` 以下方降级候选 |
+| 一手走完概率 | `oneStepFinishShare` | 对手 n 张余牌“恰能一手走完”的权重占比（炸弹/顺子/三带等全牌型路径） |
+| 收尾形状枚举 | `finishShapeWeights` / `enumeratePartitions` | 对手余牌 3~6 张时枚举所有“恰好走完”的牌型路径组合，按计数构成加权（节上限 4000） |
+| 形状死封领出 | `shapeBlockLead` | 农民上家在 `shapeBlockMaxCards=6` 窗口内领出 `leadShapeRisk` 最小的候选——把死封窗口从 ≤2 张扩展到 ≤6 张 |
+| 炸弹 EV | `shouldUseBomb` | 硬触发短路后：封堵（`bombBlockShare=0.35`）、炸后可兜现（手数 ≤`bombCashOutHandsCap=4` 且 手数-预期掌权 ≤`bombTempoHandsCap=2`）、队友临门不压队友、王炸只用于压炸/火箭 |
+| 让牌（tank） | `unifiedFollow` 内联 | 压这手的计划代价（剩余计划下跌 + 手数未降的额外手成本）> `tankPlanCostFactor=2` 个牌权且非危急/非重计划/非冲刺/非顶牌位 → pass |
+
+**预期行为变化**：地主侧与“已现 2 张”的点数不再无谓保守（旧二元判断下一看到 4 张同点未现就怕炸）；
+农民上家在对手 3~6 张时不再递送衔接牌；hard 档不再压队友冲刺牌。
+
+**降级**：视图缺失点数时概率与形状均按未知保守估计；开关关闭时 `shouldUseBomb` 保留三条
+硬触发短路、形状死封与让牌分支整体不进入（行为与基线一致）。
+
+### 6.6 精确残局求解（endgame.go，EnableExactEndgame）
+
+把 MCTS 的“随机发牌 + rollout 胜率”换为“合法发牌分布枚举 + 完全信息博弈求解”，
+在残局窗口内给出可证的答案。
+
+**启用条件（exactEndgameUsable）**：开关开启 + 记牌视图完整（无未跟踪点数）+
+未知牌总数 ≤ `exactMaxUnknownCards=12`。典型残局（两家各 ≤6 张）在此窗口内。
+
+```
+enumerateDeals(unknown, upCount, downCount, cap=300)
+  DP 方案数表 ways[i][l][r]（饱和到 cap+1）决定路径：
+    ≤ cap → 完整枚举；> cap → 按子树方案数权重确定性游走抽样 cap 个分布
+  叶节点校验 left==0 && right==0，保证无“张数不符/权重 0”的非法分布
+  分布权重 = ∏ C(U_i, up_i) · C(U_i - up_i, down_i)   // 超几何，下家从上家份额后的余量取
+
+endgameSolver.solve(counts[3], last, leader, toMove)   // 阵营由 exactCampOf 定
+  完全信息三方最优博弈 DFS + 状态记忆化（exactKey = 三席计数 + 上一手牌型/KeyRank/Length + leader + toMove）
+  返回三态：exactWin / exactLose / exactOpen（未收敛）
+  预算：单候选单分布 ≤ exactNodesCap=60000 节点，每 512 节点检查 deadline
+
+exactEndgamePlay(gctx, deadline)
+  分布外层×候选内层，单分布内记忆表跳候选共享（候选只是首手不同，子问题高度重叠）
+  候选价值 = 已收敛分布的加权胜率；一手清空直接短路（胜率 1）
+  全部候选未收敛 → ok=false，回落 UCT rollout（不把猜测当答案）
+```
+
+**与 UCT 的关系**：精确求解接管时候选价值不再依赖采样噪声；未启用/视图不完整/未知牌过多/超时
+四种情形均回到原有 rollout 框架，因此降级路径与基线一致。
+
+### 6.7 候选生成与带牌小牌化（rule/hints.go）
 
 **GenerateHints**：领出调用 `generateLeadHints`（全牌型合法组合），跟牌调用 `generateFollowHints`（含拆牌跟牌），结果按 Score 升序排序。
 
@@ -759,9 +909,12 @@ go vet ./internal/games/ddz/bot/
 | 统一可压判定源 | `rule.CanBeatWithHand`（session 三端一致）+ 顺子族窗口终点比较 + 拆牌跟牌 | §4.4 |
 | 农民上家主攻模式 | `farmerUpperAttackMode` 动态指派（A1~A4 触发 + 死封/送权否决）+ 领出/跟牌/MCTS 三处行为切换 | §5.4 |
 | 人格化三档难度 | `DefaultPersonalities` + `intentionalImperfection` + 记牌视图完整度 + 全链路档位传递 | §3.3 |
-| MCTS 残局增强 | UCT + 三席位阵营 rollout + 并行 + 真实余牌发牌 | §5.5 |
+| MCTS 残局增强 | UCT + 三席位阵营 rollout + 并行 + 真实余牌发牌；400ms 搜索预算超时回退规则引擎 | §5.5 |
+| 整手拆牌计划器 | `planDFS` 价值函数（手数成本+绝对掌权加分-暴露小牌惩罚）择优拆分，领出计划内首步/跟牌剩余计划一致（EnablePlanner） | §6.4 |
+| 对手推断层 | 持炸概率（超几何）+ 余牌收尾形状枚举 + 形状死封领出 + 炸弹 EV + 让牌 tank（EnableInference） | §6.5 |
+| 精确残局求解 | 合法发牌分布枚举 + 完全信息三方最优博弈 DFS 记忆化，分布加权胜率接管 UCT rollout（EnableExactEndgame） | §6.6 |
 | 决策解释与复盘 | 通用 replay 层 + `DDZReplayAdapter` + 真人失误离线分析 + `/api/replays` | §3.4 |
-| 叫分结构因子 | `structureBonus`（手数节省×0.3 + 连续点数奖励）+ `isolatedPenalty` | §6.3 |
+| 叫分/加倍模型 | 基线 `structureBonus`+`isolatedPenalty`；EnableBidModel 叠加绝对控制组数/炸弹非线性/断点修复 + 加倍"能一波走/有炸才加"判据 | §6.3 |
 | 决策性能 | `handCountCache` 回合缓存（命中率 >80%）+ MCTS 并行 rollout（batchSize=100） | §7 |
 | 收官决策 | 一次走完优先（`finishingLead`）+ 两步走完夺权牌（`twoStepFinishWithControl`） | §5.2 |
 | 局势反制 | 拆牌重计划（`UnbeatenStreak`）+ 跑牌方积极跟牌（`pickShedFollow`）+ 带牌小牌化 + 多牌型跟牌放宽 | §5.3 |
@@ -770,7 +923,7 @@ go vet ./internal/games/ddz/bot/
 
 #### 高优先级：对手建模简化版
 
-**现状**：过牌推理（PassInfo 单轮 + CumPasses 累积）与 MCTS 真实余牌发牌已覆盖"牌张在哪"的推断；但机器人不记忆对手风格，每局都像第一次见面。
+**现状**：过牌推理（PassInfo 单轮 + CumPasses 累积）、点数持有权概率与余牌形状推断（`inference.go`，§6.5）、MCTS 真实余牌发牌已覆盖"牌张在哪、那家下一手想走什么"的局内推断；但机器人不记忆对手**风格**，每局都像第一次见面。
 
 **实施内容**：
 1. gameTrack 增加 per-opponent EWMA 画像：出大牌率（Aggression）、让牌率（Cooperation）、炸弹使用时机（BombTiming）；单局内维护，不跨局持久化
@@ -785,8 +938,8 @@ go vet ./internal/games/ddz/bot/
 
 #### 低优先级：稳定性加固
 
-1. MCTS 超时保护：context 400ms 超时，超时回退规则引擎并记日志
-2. 长时间运行下的 goroutine 数量监控（handCountCache 已按回合新建，无泄漏风险）
+1. ✅ 已完成：MCTS/残局搜索超时保护（`context.WithTimeout(400ms)`，超时回退规则引擎并记 Warn 日志，见 §5.5）
+2. 长时间运行下的 goroutine 数量监控（handCountCache/planCache 已按回合新建，无泄漏风险）
 3. 压测基线：记录当前 100 局自战耗时作为回归基线
 
 ### 10.3 明确放弃的优化方向
@@ -811,6 +964,8 @@ go vet ./internal/games/ddz/bot/
 ✅ 人格化三档难度（全链路打通：前端选择 → 服务端转发 → 引擎参数 + 复盘真实档位）
 ✅ 决策解释与复盘系统（四游戏集成 + 后端 API + 前端全链路 + 真人失误分析）
 ✅ 性能优化（handCountCache + MCTS 并行 rollout + rollout 步数自适应）
+✅ 决策增强（按 hard 档接线）：整手拆牌计划器 + 对手推断层 + 精确残局求解 + 叫分/加倍模型（均 EngineConfig 门控）
+✅ 稳定性加固：MCTS/残局搜索 400ms 超时回退规则引擎
 
 ↓ 近期
 🔄 对手建模简化版：EWMA 风格画像 + MCTS 发牌风格先验
@@ -820,7 +975,7 @@ go vet ./internal/games/ddz/bot/
 📋 主攻模式动态指派扩展到地主下家（对称判定 + 模拟回归验证）
 
 ↓ 远期
-⚡ 稳定性加固：MCTS 超时保护 + 压测回归基线
+⚡ 稳定性加固：长时间运行 goroutine 监控 + 压测回归基线
 ```
 
 **定位重申**：不追求"最强 AI"，打造"最懂玩家的对手"——新手在 easy 档找到乐趣，进阶玩家通过复盘提升牌技，高手在 hard 档获得挑战。
@@ -833,7 +988,8 @@ go vet ./internal/games/ddz/bot/
 
 | 函数 | 文件 | 功能 |
 |------|------|------|
-| Engine.DecidePlay | engine.go | 出牌决策总入口（三级调度 + 故意犯错 + 决策日志） |
+| Engine.DecidePlay | engine.go | 出牌决策总入口（生效开关注入 + 三级调度 + 故意犯错 + 决策日志） |
+| Engine.playConfig / ProductionConfig / HardPlayConfig | engine.go | 生产接线：按难度档位覆写出牌决策开关 |
 | immediateWinPlay | strategy.go | P0 硬规则：一步清空手牌的出法直接返回 |
 | intentionalImperfection | personality.go | 故意犯错机制（P0 护栏：清空手牌永不替换） |
 | unifiedPlay | strategy.go | 统一出牌分发（领出/跟牌） |
@@ -845,7 +1001,7 @@ go vet ./internal/games/ddz/bot/
 | pickBlockCard | strategy.go | 顶牌（中段优先逼地主消耗 2/王） |
 | pickShedFollow | strategy.go | 积极跟牌（≤J 同路小牌，2/王保留，手数不增） |
 | pickReliefBeat | strategy.go | 接应队友小牌（同路优先、手数不增） |
-| shouldUseBomb | strategy.go | 炸弹使用时机判断 |
+| shouldUseBomb | strategy.go | 炸弹使用时机判断（硬触发短路 + EV 判定） |
 | likelyWin | strategy.go | 预估胜出判断（绝对控制 + 过牌推理 + 无炸威胁） |
 | noBeatFromPass | strategy.go | 过牌推理（单轮 + 累积声明） |
 | twoStepFinishWithControl / isTwoStepControl | strategy.go | 两步走完+绝对夺权牌检测（支持所有牌型） |
@@ -860,8 +1016,12 @@ go vet ./internal/games/ddz/bot/
 | mctsQuickPlay | mcts.go | rollout 简化出牌策略（领出最小/跟牌最小可压） |
 | shouldUseMCTS / getMctsIterations | mcts.go | 触发条件与动态模拟次数 |
 | MinHandCount | handcount.go | DFS+记忆化手数计算 |
+| planDFS / planGroupValue / planCache / planUsable | handplan.go | 整手拆牌计划器（价值函数择优拆分 + 回合缓存，EnablePlanner） |
+| bombHoldProb / oneStepFinishShare / finishShapeWeights / shapeBlockLead | inference.go | 持炸概率/一手走完概率/收尾形状枚举/形状死封（EnableInference） |
+| enumerateDeals / endgameSolver.solve / exactEndgamePlay | endgame.go | 合法发牌分布枚举 + 完全信息精确求解（EnableExactEndgame） |
 | unknownCounts / potentialBombRanks / isAbsoluteControl | tracker.go | 未知牌池、炸弹预警、绝对控制 |
-| handStrength / structureBonus / isolatedPenalty | bid.go | 手牌强度评分（含结构因子与孤张惩罚） |
+| handStrength / structureBonus / isolatedPenalty | bid.go | 手牌强度评分（基线口径，含结构因子与孤张惩罚） |
+| handStrengthV2 / absoluteControls / bombScoreV2 / shouldDoubleV2 | bid.go | 叫分/加倍模型（控制牌/炸弹非线性/断点修复 + 手数牌权判据，EnableBidModel） |
 | GenerateHints | rule/hints.go | 候选生成入口（领出/跟牌，含拆牌跟牌） |
 | CanBeatWithHand | rule/beat.go | 统一可压判定源（支持拆牌跟牌 + 顺子族窗口终点比较） |
 | ParseHand | rule/rule.go | 牌型解析（16 种牌型，KeyRank=窗口终点） |

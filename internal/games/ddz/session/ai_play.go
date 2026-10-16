@@ -82,6 +82,8 @@ func (gs *Session) autoplayByEngine(idx int) {
 		DownIsLandlord: down.IsLandlord,
 		HasPlayed:      gs.oncePlayed[idx],
 		UnbeatenStreak: gs.beatStreaks[idx],
+		LandlordBid:    gs.highBid, // 叫分档先验（对手建模：地主叫分越高牌力越强）
+		Difficulty:     "hard",     // 自建全量记牌视图 = 专家档，同步启用出牌决策增强
 	}
 
 	cards := gs.engine.DecidePlay(context.Background(), player.Name, gctx)

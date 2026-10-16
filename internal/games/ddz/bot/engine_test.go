@@ -407,8 +407,10 @@ func TestFollow_LikelyWinByPassInfer(t *testing.T) {
 func TestFollow_TeammateNearFinish(t *testing.T) {
 	t.Parallel()
 	e := newTestEngine()
+	// 手牌 7 张（> MCTS 触发阈值 5）且地主 8 张（>3）：决策走确定性规则路径，
+	// 不被残局 MCTS 随机 sampling 接管（构造确定性场景避免断言误判）
 	base := GameContext{
-		Hand:           cards("4 4 4 5 9"),
+		Hand:           cards("4 4 4 5 9 K A"),
 		RecentPlays:    [2]PlayRecord{play("4", false), {}}, // 队友领出小牌（需接应的牌）
 		CanBeat:        true,
 		DownIsLandlord: true,

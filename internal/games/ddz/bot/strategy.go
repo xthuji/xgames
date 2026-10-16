@@ -89,23 +89,35 @@ func unifiedLead(gctx GameContext) []card.Card {
 		}
 	}
 
+	// 形状死封（EnableInference，见 inference.go）：死封窗口从 ≤2 扩到 ≤6——
+	// 地主余牌 3~6 张时按其最可能收尾路径权重避开领出衔接机会
+	if gctx.Cfg.EnableInference && isFarmerUpperSeat(gctx) && minOpponentCount(gctx) <= shapeBlockMaxCards {
+		if c := shapeBlockLead(gctx); c != nil {
+			return c
+		}
+	}
+
 	// 局势化领出（规则 2/3/4）：
-	// 对手 <6 张 → 谨慎控牌，保持压制力，避免送小牌给对手收权；
-	// 正常局势（对手余牌较多）：地主领出，或农民且下家是队友 →
-	// 优先大批量牌型（连对/顺子/三带一等）或最小单张/对子；
-	// 农民且下家是地主且对手 >10 张 → 防其跟跑小牌的快速跑牌。
+	// 对手 <6 张 → 谨慎控牌（硬短路：对手临门时计划评分无法体现放小牌即败的
+	// 风险，任何配置下保留）；正常局势（对手余牌较多）：地主领出，或农民且
+	// 下家是队友 → 优先大批量牌型或最小单张/对子；农民且下家是地主且
+	// 对手 >10 张 → 防其跟跑小牌的快速跑牌。
+	// 计划器启用时跳过正常局势段（规则 3/4）：局部启发式（快跑）换成整手
+	// 拆牌计划的全局择优（见下方计划驱动候选段）；P0/P1 硬规则仍前置短路不动。
 	enemyMin, enemyMax := minOpponentCount(gctx), maxOpponentCount(gctx)
 	if enemyMin <= 5 {
 		if c := pickCautiousLead(gctx); c != nil {
 			return c
 		}
-	} else if gctx.IsLandlord || nextSeatIsTeammate(gctx) {
-		if c := pickFastShed(gctx, true); c != nil {
-			return c
-		}
-	} else if enemyMax > 10 {
-		if c := pickFastShed(gctx, false); c != nil {
-			return c
+	} else if !planUsable(&gctx) {
+		if gctx.IsLandlord || nextSeatIsTeammate(gctx) {
+			if c := pickFastShed(gctx, true); c != nil {
+				return c
+			}
+		} else if enemyMax > 10 {
+			if c := pickFastShed(gctx, false); c != nil {
+				return c
+			}
 		}
 	}
 
@@ -134,13 +146,24 @@ func unifiedLead(gctx GameContext) []card.Card {
 	current := minHandCountWithCache(&gctx, handToCounts(hand))
 	unknown := unknownCounts(gctx.RemainingCards, hand)
 	bombThreat := len(potentialBombRanks(unknown)) > 0
+	// 概率化炸弹预警（EnableInference）：全有/全无二元判断换成超几何持炸概率，
+	// 叫分先验修正；低于阈值不再无谓保守（地主侧/已现点数场景不再误伤）
+	if gctx.Cfg.EnableInference {
+		bombThreat = bombThreatProb(gctx, unknown, opponentSeatCount(gctx), allySeatCount(gctx)) > bombProbThreshold
+	}
+	// 整手拆牌计划器（EnablePlanner）：候选是否在最优/备选拆分计划内，
+	// 作为排序首键——计划一致性优先于局部 wins/split/power 贪心（见 handplan.go）
+	usePlan := planUsable(&gctx)
+	handCounts := handToCounts(hand)
 
 	type candidate struct {
-		cards []card.Card
-		score int
-		wins  bool // 预估胜出：打出后牌权必然/大概率回到己方（含绝对控制与过牌推理）
-		split int  // 拆牌代价：拆散的对子/三条数量（掌权王牌加倍），同分时优先不拆牌
-		power int  // 掌权王牌消耗：非胜出候选消耗掌权牌加罚，谨慎使用
+		cards    []card.Card
+		score    int
+		wins     bool // 预估胜出：打出后牌权必然/大概率回到己方（含绝对控制与过牌推理）
+		split    int  // 拆牌代价：拆散的对子/三条数量（掌权王牌加倍），同分时优先不拆牌
+		power    int  // 掌权王牌消耗：非胜出候选消耗掌权牌加罚，谨慎使用
+		inPlan   bool // 在整手最优/备选计划内（首步覆盖集）
+		planKey  int  // 计划内组值：升序优先（先出最难守的组，掌权组留作收牌权）
 	}
 	var cands, fallback []candidate
 	for _, h := range rule.GenerateHints(hand, rule.ParsedHand{}) {
@@ -152,10 +175,17 @@ func unifiedLead(gctx GameContext) []card.Card {
 			continue // 过滤导致总手数增加的出牌动作
 		}
 		wins := false
+		inPlan := false
+		planKey := 0
 		if ph, perr := rule.ParseHand(h.Cards); perr == nil {
 			wins = likelyWin(gctx, unknown, ph)
+			if usePlan {
+				rest := subtractCounts(handCounts, handToCounts(h.Cards))
+				inPlan = gctx.planCache.firstStepCovered(handCounts, ph, rest)
+				planKey = planGroupValue(unknown, ph)
+			}
 		}
-		c := candidate{cards: h.Cards, score: h.Score, wins: wins,
+		c := candidate{cards: h.Cards, score: h.Score, wins: wins, inPlan: inPlan, planKey: planKey,
 			split: splitPenaltyEx(hand, h.Cards), power: powerLeadCost(h.Cards, wins)}
 		// 潜在炸弹预警：存在对手可炸的点数时，裸出大牌单/对有被炸风险，降级备选
 		if bombThreat && isRiskyBigLead(h.Cards, unknown) {
@@ -169,6 +199,12 @@ func unifiedLead(gctx GameContext) []card.Card {
 	}
 	if len(cands) > 0 {
 		sort.Slice(cands, func(i, j int) bool {
+			if usePlan && cands[i].inPlan != cands[j].inPlan {
+				return cands[i].inPlan // 计划内首步优先（整手拆分一致性）
+			}
+			if usePlan && cands[i].inPlan && cands[i].planKey != cands[j].planKey {
+				return cands[i].planKey < cands[j].planKey // 计划内先出低价组（暴露小/难守），留掌权组收权
+			}
 			if cands[i].wins != cands[j].wins {
 				return cands[i].wins // 预估胜出优先（确保收回出牌权）
 			}
@@ -180,14 +216,56 @@ func unifiedLead(gctx GameContext) []card.Card {
 			}
 			return cands[i].score < cands[j].score
 		})
-		
-		// P0: 应用故意犯错机制
-		chosen := cands[0].cards
-		// 注意：此处无法访问 personality，需要在调用层处理
-		return chosen
+		// 回记引擎真实排序清单：故意犯错在此取次优项，而非 GenerateHints 原始
+		// 评分序（两者口径不一致，见计划 §Phase 3）
+		if gctx.leadRank != nil {
+			ranked := make([][]card.Card, 0, len(cands))
+			for _, c := range cands {
+				ranked = append(ranked, c.cards)
+			}
+			gctx.leadRank.cards = ranked
+		}
+		return cands[0].cards
 	}
 	// 仅剩炸弹类组合或全部候选都增手数：兜底出最小整组
 	return fallbackLead(hand)
+}
+
+// rankedLeadMoves 为短路分支领出的 chosen 生成同口径备选清单（计划 §Phase 3）：
+// unifiedLead 的常规局势段（快跑/死封/送队友等）直接返回单点决策，没有排序
+// 候选集；此处以"不减手数 + 不毁炸弹/王炸"过滤出同型（张数相同）候选，按
+// 关键点升序排在 chosen 之后，故意犯错取次项即"多花一点的同型大牌"。
+func rankedLeadMoves(gctx *GameContext, chosen []card.Card) [][]card.Card {
+	hand := gctx.Hand
+	parsed, err := rule.ParseHand(chosen)
+	if err != nil {
+		return nil
+	}
+	current := minHandCountWithCache(gctx, handToCounts(hand))
+	type alt struct {
+		cards []card.Card
+		key   card.Rank
+	}
+	var alts []alt
+	for _, h := range rule.GenerateHints(hand, rule.ParsedHand{}) {
+		if isBombLike(h.Cards) || breaksBomb(hand, h.Cards) || breaksRocket(hand, h.Cards) {
+			continue
+		}
+		if minHandCountWithCache(gctx, subtractCounts(handToCounts(hand), handToCounts(h.Cards))) != current-1 {
+			continue
+		}
+		ph, perr := rule.ParseHand(h.Cards)
+		if perr != nil || ph.Type != parsed.Type || len(ph.Cards) != len(chosen) || ph.KeyRank <= parsed.KeyRank {
+			continue
+		}
+		alts = append(alts, alt{cards: h.Cards, key: ph.KeyRank})
+	}
+	sort.Slice(alts, func(i, j int) bool { return alts[i].key < alts[j].key })
+	out := [][]card.Card{chosen}
+	for _, a := range alts {
+		out = append(out, a.cards)
+	}
+	return out
 }
 
 // unifiedFollow 跟牌：农民配合 → 残局强封 → 手数过滤（控制牌优先）→ 保守用炸
@@ -270,10 +348,20 @@ func unifiedFollow(gctx GameContext) []card.Card {
 	}
 
 	unknown := unknownCounts(gctx.RemainingCards, hand)
+	// 计划器平手比较（EnablePlanner）：control/after/score 全平时比"压完后剩余手牌
+	// 的最优计划评分"；仅候选数 ≤8 时启用，避免逐候选计划搜索爆炸
+	usePlan := planUsable(&gctx) && len(hints) <= 8
+	// 让牌 tank（EnableInference，计划 §Phase 3）：同受限候选数启用（需计划器提供计划评分）
+	useTank := gctx.Cfg.EnableInference && planUsable(&gctx) && len(hints) <= 8
+	planBase := 0
+	if useTank {
+		planBase = gctx.planCache.value(handToCounts(hand))
+	}
 
 	var best []card.Card
 	bestAfter := 1 << 30
 	bestControl := false
+	bestPlan := 0
 	for _, h := range hints {
 		if !beatsTarget(h.Cards, target) {
 			continue // 提示系统可能含类型不匹配的候选，出牌前必须验证可压
@@ -285,7 +373,8 @@ func unifiedFollow(gctx GameContext) []card.Card {
 		if !bomb && (breaksBomb(hand, h.Cards) || breaksRocket(hand, h.Cards)) {
 			continue // 非危急绝不拆炸弹/王炸
 		}
-		after := minHandCountWithCache(&gctx, subtractCounts(handToCounts(hand), handToCounts(h.Cards)))
+		rest := subtractCounts(handToCounts(hand), handToCounts(h.Cards))
+		after := minHandCountWithCache(&gctx, rest)
 		// 多牌型目标（顺子/连对/飞机族）：对手一手可走 5 张以上，放行的节奏
 		// 价值（P2）高于我方拆 1 组的结构代价（P3），after > current 的候选
 		// 不直接丢弃，允许拆散至多 1 组对子/三条进入择优
@@ -299,6 +388,18 @@ func unifiedFollow(gctx GameContext) []card.Card {
 		if ph, perr := rule.ParseHand(h.Cards); perr == nil {
 			control = likelyWin(gctx, unknown, ph)
 		}
+		planV := 0
+		if usePlan || useTank {
+			planV = gctx.planCache.value(rest)
+		}
+		// 让牌（tank，计划 §Phase 3）：压这手的计划代价 = 剩余计划评分下跌
+		// + 手数未能减少的额外手成本（每手 planCostPerHand），超过 2 个牌权
+		// 则放过——跑牌方不为对手小牌烧结构。地主上家（顶牌位）豁免：
+		// 封堵职责优先于结构保全；重计划/危急/冲刺状态不让牌。
+		if useTank && !control && !danger && !replan && !sprint && !isFarmerUpperSeat(gctx) &&
+			planBase-planV+planCostPerHand*(after-current+1) > tankPlanCostFactor*planControlBonus {
+			continue
+		}
 		// 掌权王牌保护：非预估胜出时不用 Q/K/A/2 去压小牌（目标牌较小且
 		// 自己不是危急/谨慎状态），掌权牌留作后手收权；但连续无法管住
 		// 对手时放开 Q/K/A 夺回牌权（2 与王仍留作终极收权底牌）。
@@ -311,12 +412,13 @@ func unifiedFollow(gctx GameContext) []card.Card {
 				continue
 			}
 		}
-		// 选择顺序：预估胜出牌优先 → 手数更优 → 评分更优
+		// 选择顺序：预估胜出牌优先 → 手数更优 → 评分更优 → 剩余计划评分更优（计划器平手比）
 		if best == nil ||
 			(control && !bestControl) ||
 			(control == bestControl && after < bestAfter) ||
-			(control == bestControl && after == bestAfter && h.Score < scoreCards(best)) {
-			best, bestAfter, bestControl = h.Cards, after, control
+			(control == bestControl && after == bestAfter && h.Score < scoreCards(best)) ||
+			(usePlan && control == bestControl && after == bestAfter && h.Score == scoreCards(best) && planV > bestPlan) {
+			best, bestAfter, bestControl, bestPlan = h.Cards, after, control, planV
 		}
 	}
 	if best == nil && !gctx.HasPlayed {
@@ -557,7 +659,9 @@ func pickShedFollow(hand []card.Card, hints []rule.Hint, target rule.ParsedHand,
 	return best
 }
 
-// shouldUseBomb 是否值得动用炸弹：对手危急 / 自己可冲刺走完 / 手牌已很少
+// shouldUseBomb 是否值得动用炸弹：三条硬触发短路（对手危急/炸完即走/手牌很少），
+// 推断层启用后追加 EV 判据（计划 §Phase 3）：队友冲刺不压炸、王炸只用于压炸、
+// 封堵一波流、炸后计划可兑现。
 func shouldUseBomb(gctx GameContext, bombCards []card.Card) bool {
 	if minOpponentCount(gctx) <= 2 {
 		return true // 对手即将走完，必须压制
@@ -567,6 +671,37 @@ func shouldUseBomb(gctx GameContext, bombCards []card.Card) bool {
 	}
 	if len(gctx.Hand) <= 5 {
 		return true // 手牌很少，争取一波带走
+	}
+	if !gctx.Cfg.EnableInference {
+		return false // 基线：纯计数短路，无 EV 判断
+	}
+
+	// 农民视角：队友（非地主）剩 ≤2 张且上家是队友冲刺牌 → 不压队友的牌
+	if !gctx.IsLandlord && lastPlayByTeammate(gctx) && teammateCount(gctx) <= 2 {
+		return false
+	}
+
+	unknown := unknownCounts(gctx.RemainingCards, gctx.Hand)
+	// 王炸独立预算：只用于压炸/火箭（硬触发已在上方短路），不为普通小牌毁王炸
+	// ——保留作为全场剩余炸弹/火箭威胁（PlayedBombs + 持炸概率推断）的终极应对
+	if isRocketCards(bombCards) {
+		return isBombLike(gctx.RecentPlays[0].Played.Cards)
+	}
+	// 封堵：对手余牌 3~6 张且"下一手即走完"的最可能收尾路径权重占比高 → 炸
+	if opp := opponentSeatCount(gctx); opp >= 3 && opp <= shapeBlockMaxCards {
+		if oneStepFinishShare(unknown, opp) >= bombBlockShare {
+			return true
+		}
+	}
+	// 炸后可兑现：剩余手牌手数不多（≤ bombCashOutHandsCap）且
+	// 手数 - 预期掌权组 ≤ 2（每步都有收权牌兜底）→ 炸得值
+	if planUsable(&gctx) {
+		rest := subtractCounts(handToCounts(gctx.Hand), handToCounts(bombCards))
+		hands := minHandCountWithCache(&gctx, rest)
+		if hands <= bombCashOutHandsCap &&
+			hands-planControlEst(gctx.planCache.value(rest), hands) <= bombTempoHandsCap {
+			return true
+		}
 	}
 	return false
 }

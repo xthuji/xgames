@@ -87,9 +87,9 @@ export class KlotskiScene extends Phaser.Scene {
       this.newGame();
     });
     mkBtn(1010, '🔄 重新开始', () => this.newGame());
-    const exitBtn = this.add.text(1260, 24, '🚪 退出', {
+    const exitBtn = this.add.text(1265, 24, '🚪 退出', {
       ...FONT, fontSize: '16px', color: '#ff8a80', backgroundColor: '#00000066', padding: { x: 8, y: 4 },
-    }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+    }).setOrigin(1, 0.5).setInteractive({ useHandCursor: true });
     exitBtn.on('pointerdown', () => this.exitToLobby());
   }
 

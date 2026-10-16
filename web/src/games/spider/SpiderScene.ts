@@ -53,7 +53,19 @@ function fmtTime(s: number): string {
 const SUIT_GLYPHS = ['♠', '♥', '♣', '♦'];
 const RANK_NAMES = ['', 'A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
 
-/** 蜘蛛纸牌（单机）：点选移动 + 备牌发牌 + K→A 自动收集，计分 500 起、每步 −1、每组 +100 */
+/** 每局允许的撤回次数上限 */
+const MAX_UNDO = 3;
+
+/** 撤回快照：一步操作前的完整局面（含备牌/完成区/计分），供有限次数回退 */
+interface SpiderSnapshot {
+  tableau: SpiderCard[][];
+  stock: SpiderCard[][];
+  done: SpiderCard[][];
+  score: number;
+  moves: number;
+}
+
+/** 蜘蛛纸牌（单机）：点选移动 + 备牌发牌 + K→A 自动收集，计分 500 起、每步 −1、每组 +100；每局限 3 次撤回 */
 export class SpiderScene extends Phaser.Scene {
   private layout!: SpiderLayout;
   private done: SpiderCard[][] = [];
@@ -67,6 +79,11 @@ export class SpiderScene extends Phaser.Scene {
   private hudText!: Phaser.GameObjects.Text;
   private timer?: Phaser.Time.TimerEvent;
   private overlay?: Phaser.GameObjects.Container;
+  /** 撤回历史栈（最多保留 MAX_UNDO 个快照） */
+  private history: SpiderSnapshot[] = [];
+  /** 本局剩余撤回次数 */
+  private undosLeft = MAX_UNDO;
+  private undoBtn!: Phaser.GameObjects.Text;
   
   // === 渲染优化：持久化精灵 + 增量更新 ===
   /** 列占位区 */
@@ -127,9 +144,14 @@ export class SpiderScene extends Phaser.Scene {
     }).setOrigin(0.5).setInteractive({ useHandCursor: true });
     restartBtn.on('pointerdown', () => this.newGame());
 
-    const exitBtn = this.add.text(1260, 24, '🚪 退出', {
-      ...FONT, fontSize: '16px', color: '#ff8a80', backgroundColor: '#00000066', padding: { x: 8, y: 4 },
+    this.undoBtn = this.add.text(1144, 24, '', {
+      ...FONT, fontSize: '16px', color: '#80cbc4', backgroundColor: '#00000066', padding: { x: 8, y: 4 },
     }).setOrigin(0.5).setInteractive({ useHandCursor: true });
+    this.undoBtn.on('pointerdown', () => this.undo());
+
+    const exitBtn = this.add.text(1265, 24, '🚪 退出', {
+      ...FONT, fontSize: '16px', color: '#ff8a80', backgroundColor: '#00000066', padding: { x: 8, y: 4 },
+    }).setOrigin(1, 0.5).setInteractive({ useHandCursor: true });
     exitBtn.on('pointerdown', () => this.exitToLobby());
   }
 
@@ -145,6 +167,8 @@ export class SpiderScene extends Phaser.Scene {
     this.seconds = 0;
     this.over = false;
     this.started = false;
+    this.history = [];
+    this.undosLeft = MAX_UNDO;
     clearHint(this);
     this.lastStateHash = ''; // 重置状态哈希
     this.isInitialized = false;
@@ -223,6 +247,8 @@ export class SpiderScene extends Phaser.Scene {
 
   private updateHud() {
     this.hudText.setText(`⏱ ${fmtTime(this.seconds)}    💰 ${this.score} 分    🃏 ${this.moves} 步    📦 备牌 ${this.layout.stock.length}`);
+    this.undoBtn.setText(`↩ 撤回 ×${this.undosLeft}`);
+    this.undoBtn.setColor(this.undosLeft > 0 ? '#80cbc4' : '#5f7d78');
   }
 
   // ── 渲染（持久化精灵 + 增量更新）──
@@ -320,6 +346,11 @@ export class SpiderScene extends Phaser.Scene {
     
     const stockN = this.layout.stock.length;
     if (stockN > 0) {
+      // 撤回可能使备牌重新出现：清掉残留的“备牌已发完”文本
+      const stale = this.layer.getAll().find(
+        (obj) => obj instanceof Phaser.GameObjects.Text && (obj as Phaser.GameObjects.Text).text === '备牌已发完',
+      );
+      if (stale) stale.destroy();
       for (let k = 0; k < stockN; k++) {
         const s = this.add.sprite(STOCK_X + k * 4, STOCK_Y, 'poker', BACK_FRAME).setOrigin(0, 0);
         if (k === stockN - 1) {
@@ -419,6 +450,7 @@ export class SpiderScene extends Phaser.Scene {
   }
 
   private doMove(from: number, index: number, to: number) {
+    this.pushHistory();
     clearHint(this);
     const src = this.layout.tableau[from];
     const moving = src.splice(index);
@@ -440,6 +472,7 @@ export class SpiderScene extends Phaser.Scene {
       this.toast('所有牌列都必须有牌才能发牌');
       return;
     }
+    this.pushHistory();
     dealRound(this.layout);
     this.sel = null;
     for (let i = 0; i < COLS; i++) this.collectFrom(i);
@@ -462,21 +495,65 @@ export class SpiderScene extends Phaser.Scene {
     }
   }
 
+  // ── 撤回（有限次数）──
+
+  /** 记录一步操作前的完整局面快照，超出上限则丢弃最旧的（只保留最近 MAX_UNDO 步） */
+  private pushHistory() {
+    this.history.push({
+      tableau: this.layout.tableau.map((col) => col.map((c) => ({ ...c }))),
+      stock: this.layout.stock.map((pile) => pile.map((c) => ({ ...c }))),
+      done: this.done.map((run) => run.map((c) => ({ ...c }))),
+      score: this.score,
+      moves: this.moves,
+    });
+    if (this.history.length > MAX_UNDO) this.history.shift();
+  }
+
+  /**
+   * 撤回上一步（移牌或发牌）：还原牌列/备牌/完成区与计分步数。
+   *
+   * 每局最多 MAX_UNDO 次，用完即禁用；快照还原会把当时自动收走的整组一并撤销。
+   */
+  private undo() {
+    if (this.over || !this.started) return;
+    if (this.undosLeft <= 0) {
+      this.toast('撤回次数已用完');
+      return;
+    }
+    const snap = this.history.pop();
+    if (!snap) {
+      this.toast('没有可撤回的操作');
+      return;
+    }
+    this.layout = { tableau: snap.tableau, stock: snap.stock };
+    this.done = snap.done;
+    this.score = snap.score;
+    this.moves = snap.moves;
+    this.sel = null;
+    this.undosLeft--;
+    clearHint(this);
+    this.updateHud();
+    this.render();
+  }
+
   // ── 提示与结算 ──
 
   /**
    * 提示：高亮推荐搬动的整段牌（绿）与目标列顶牌（黄）。
    *
    * 只打分不代劳：列号文案配得上面上的第几列，玩家自己点选过去。
+   * findHint 返回结构化的 kind：move/setup/fill 走高亮，deal/none 只出一行文案。
    */
   private showHint() {
     if (this.over || !this.started) return;
     const h = findHint(this.layout);
-    if (!h) {
-      clearHint(this);
-      if (canDeal(this.layout)) showHintText(this, '没有划算的移牌了，点左下角备牌发一轮再看', { y: HINT_Y });
-      else if (this.layout.stock.length > 0) showHintText(this, '有空列时不能发牌，先把牌移到空列再发牌', { y: HINT_Y });
-      else showHintText(this, '已没有有价值的移动，只能从现有局面里选择', { y: HINT_Y });
+    clearHint(this);
+    if (h.kind === 'deal') {
+      showHintText(this, '没有划算的移牌了，点左下角备牌发一轮再看', { y: HINT_Y });
+      return;
+    }
+    if (h.kind === 'none') {
+      showHintText(this, '已无有意义的移动，只能发牌、回退或重新开局', { y: HINT_Y });
       return;
     }
     const t = this.layout.tableau;
@@ -495,7 +572,15 @@ export class SpiderScene extends Phaser.Scene {
       : { x: TABLEAU_X + h.to * COL_STEP + CARD_W / 2, y: TABLEAU_Y + CARD_H / 2, w: CARD_W, h: CARD_H, color: 0xffd54f }];
     highlightBoxes(this, boxes);
     const head = t[h.from][h.index];
-    const why = h.collect ? '搬完能集齐一组 K→A' : h.opens ? '还能翻开一张暗牌' : '把同花色接上序列';
+    const why = h.kind === 'setup'
+      ? (h.enables === 'collect' ? '为下一步集齐一组 K→A 铺路' : h.enables === 'open' ? '为下一步翻开暗牌铺路' : '为下一步同花色接续铺路')
+      : h.kind === 'fill'
+        ? '填入空列后即可发牌'
+        : h.collect
+          ? '搬完能集齐一组 K→A'
+          : h.opens
+            ? '还能翻开一张暗牌'
+            : '把同花色接上序列';
     showHintText(this, `把第 ${h.from + 1} 列的 ${h.count} 张（${SUIT_GLYPHS[head.suit]}${RANK_NAMES[head.rank]} 起）移到第 ${h.to + 1} 列 · ${why}`, { y: HINT_Y });
   }
 

@@ -3,8 +3,8 @@
 # Project Repository - 发布工具
 # =============================================================================
 # 读取根目录 VERSION 创建 git tag v{version}，推送到 GitHub 远程，
-# 触发 .github/workflows/release.yml 在 macOS / Linux / Windows 三平台
-# 自动构建并发布到 GitHub Release。
+# 触发 .github/workflows/release.yml 构建并发布到 GitHub Release
+# （构建平台与产物形态由各项目的 workflow 声明）。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,7 +30,7 @@ ${BOLD}用法:${NC} $0 [--version=<ver>] [--remote=<name>] [--dry-run]
 
 ${BOLD}说明:${NC}
   读取 VERSION 创建 git tag v{version}，推送到 GitHub 远程，
-  触发 .github/workflows/release.yml 自动构建三平台应用并发布。
+  触发 .github/workflows/release.yml 自动构建应用并发布。
 
 ${BOLD}选项:${NC}
   --version=<ver>  指定版本号 (覆盖 VERSION 文件)

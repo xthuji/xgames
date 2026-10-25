@@ -3,12 +3,14 @@ name: Release XGames
 # =============================================================================
 # v* tag 触发，三平台并行构建，汇总发布到 GitHub Release。
 #
-# 全部构建相关逻辑集中在 ./scripts/run_tools.sh build（自动按当前 runner 平台分派）：
+# 全部构建相关逻辑集中在 ./scripts/run_tools.sh（薄入口 + run_tools_master.sh 公共母版，
+# 自动按当前 runner 平台分派）：
 #   - 构建依赖准备：Linux apt 装 GTK3/WebKit2GTK + 生成 webkit2gtk-4.0.pc 兼容别名；
-#     Windows 探测/安装 MinGW-w64（CGO）；macOS 校验 clang；并自动安装 Wails CLI
-#   - 前端构建（Vite）+ 协议生成 + wails build + 打包：
-#     macOS universal (amd64+arm64, min 12.0) → .app → .dmg（含 ad-hoc 签名）；
-#     Linux / Windows → .zip
+#     Windows 纯 Go（Wails v2 走系统 WebView2，无 CGO/gcc）；macOS 校验 clang；
+#     Wails CLI 缺失时按 go.mod 依赖版本安装（防 CLI 与库版本漂移）
+#   - 前端构建（Vite，增量：清单 + mtime）+ 协议生成 + wails build -s + 打包：
+#     macOS universal (amd64+arm64, min 12.0) → .app → ad-hoc 签名 → DMG（ditto 暂存 +
+#     Applications 链接，拖拽安装）；Linux / Windows → .zip
 # 本 workflow 只做 runner 引导（checkout、Go/Node 工具链与缓存）与产物上传，不写任何
 # 系统依赖 / CGO / wails / lipo / codesign / hdiutil / zip 细节，避免与本地行为漂移。
 # =============================================================================
@@ -38,8 +40,9 @@ jobs:
         with:
           node-version: '20'
 
-      # run_tools.sh 内部完成：校验 clang → 安装 Wails CLI → 生成协议 + 构建前端(Vite)
-      # → wails build darwin/universal (min 12.0) → 生成 .app → 同步 config → hdiutil 生成 DMG
+      # run_tools.sh 内部完成：校验 clang → 安装 Wails CLI（对齐 go.mod 版本）→ 生成协议 + 构建前端(Vite)
+      # → wails build darwin/universal (min 12.0) → 生成 .app → 同步 config → plutil 修 Info.plist
+      # → ad-hoc 签名 → hdiutil 生成 DMG（暂存副本二次签名校验）
       - name: Build & package via run_tools.sh
         run: ./scripts/run_tools.sh build
 
@@ -99,8 +102,8 @@ jobs:
         with:
           node-version: '20'
 
-      # run_tools.sh 内部完成：探测/安装 MinGW-w64（CGO 所需 gcc）→ 安装 Wails CLI
-      # → 构建前端 → wails build windows/amd64 → zip 打包
+      # run_tools.sh 内部完成：Wails v2 Windows 为纯 Go（系统 WebView2，无 CGO，不需 MinGW）
+      # → 安装 Wails CLI（对齐 go.mod 版本）→ 构建前端 → wails build windows/amd64 → zip 打包
       - name: Build & package via run_tools.sh
         run: ./scripts/run_tools.sh build
 

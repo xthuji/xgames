@@ -142,6 +142,12 @@ func main() {
 			fatalf("创建输出目录失败: %v", err)
 		}
 	}
+	// 内容未变时不写：每次构建都刷新 mtime 会让 run_tools.sh 的
+	// 前端增量判定（源码 vs stamp）永远认为有改动，从而重复构建前端
+	if old, err := os.ReadFile(*out); err == nil && bytes.Equal(old, buf.Bytes()) {
+		fmt.Printf("✅ %s 无变化，跳过写入\n", *out)
+		return
+	}
 	if err := os.WriteFile(*out, buf.Bytes(), 0o644); err != nil {
 		fatalf("写入 %s 失败: %v", *out, err)
 	}
